@@ -30,11 +30,18 @@ shape by construction.
 
 ## Requirements (locked with the user)
 
-1. **Done-oracle:** a task is complete when the target repo's **executable tests pass** AND
-   the model verifier approves ("meaningful", not just green). Objective ground truth.
-2. **Workspace:** the agent works in a **branch of a git repo the user points it at**
-   (`agent/<slug>`), runs that repo's test command, and **commits as it goes**. It never
-   pushes or merges. The branch is the deliverable *and* the durable checkpoint.
+1. **Done-oracle = structured success criteria (per mission).** A mission carries a list of
+   typed `success_criteria`; it is done when **all** are satisfied. Types: `tests` (a repo's
+   test command passes — the objective oracle), `verifier` (the model verifier judges a
+   described condition), `user_approval` (you sign off), `artifact` (a named deliverable
+   exists). A code mission is typically `[tests, verifier]`; research/docs missions use
+   `[verifier]` or `[artifact, verifier]`. This generalizes "tests green + verifier" so
+   missions aren't limited to testable code.
+2. **Workspace (one or more repos):** a mission references `repos[]`, each
+   `{path, branch, test_cmd, checkpoint_commit}`. The agent works in each repo's `agent/<slug>`
+   branch, runs its test command, and **commits as it goes**; it never pushes or merges. Most
+   missions use one repo; the shape supports several (e.g. frontend + backend). The branch(es)
+   are the deliverable *and* the durable checkpoint.
 3. **Toggle + resume:** toggling off finishes the current GPU call, commits WIP, **stops the
    coder container (frees VRAM)**, and parks. Toggling on **resumes from the branch + mission
    state**. Reboot-proof (durable state, not RAM).
@@ -61,15 +68,42 @@ discards the working pipeline.
 
 ### Components (each one clear purpose, independently testable)
 
-- **`missions.py` — mission store.** Durable CRUD + state machine over SQLite.
-  Mission = `(id, title, task_prompt, repo_path, test_cmd, branch, status, iteration,
-  checkpoint_commit, created, updated)`. Status:
-  `queued → running → (paused | needs_input) → done | failed`. No model logic — data +
-  transitions only. Extends the existing SQLite persistence.
-- **`workspace.py` — workspace manager.** Owns the target repo: create/checkout
-  `agent/<slug>`, apply file edits to the working tree, run `test_cmd` in a **sandboxed
-  subprocess** (timeout, captured output), `git add/commit` WIP. Never pushes/merges. The
-  single source of "did the tests pass" and "commit the checkpoint".
+- **`missions.py` — mission store: the Mission is a first-class structured object.** Durable
+  CRUD + state machine over SQLite. Not a bag of strings — a structured intent object so it can
+  grow to research, docs, multi-repo, attachments, and clarifying questions without rework:
+
+  ```
+  Mission {
+    id, title,                 # title auto-derived from goal if omitted
+    goal,                      # prose: what to achieve
+    constraints: [ ... ],      # boundaries / what NOT to do
+    success_criteria: [        # ALL must pass to be done (see Done-oracle):
+       {type: "tests",   repo, cmd},      #   objective oracle
+       {type: "verifier", description},   #   model judges a condition
+       {type: "user_approval"},           #   you sign off
+       {type: "artifact", path} ],        #   a deliverable exists
+    repos: [ {path, branch, test_cmd, checkpoint_commit} ],   # 1+; multi-repo ready
+    artifacts: [ {role: "input"|"output", kind: "pdf"|"image"|"file"|"url",
+                  ref, description} ],     # inputs feed context; outputs are deliverables
+    notes,                     # running scratchpad: decisions, dead-ends, learnings (memory)
+    question,                  # when state=needs_input: the question posed to the user
+    state,                     # queued | running | paused | needs_input | done | failed
+    iteration, created, updated
+  }
+  ```
+
+  No model logic — data + transitions only. **The object shape is complete from day 1 (no
+  migrations); features are phased** — Phase 1 implements `goal / constraints /
+  success_criteria(tests+verifier) / repos(single) / notes / state / iteration`; `artifacts`,
+  multi-repo, and `question`/answer are schema-reserved and wired in later phases. Extends the
+  existing SQLite persistence.
+  **Reality note:** the coder (Qwen2.5-Coder) is not a vision model, so `image` artifacts are
+  *stored but not processed* until a vision-capable model exists; `pdf` inputs are processed via
+  text extraction.
+- **`workspace.py` — workspace manager.** Owns each target repo in the mission's `repos[]`:
+  create/checkout `agent/<slug>`, apply file edits, run that repo's `test_cmd` in a **sandboxed
+  subprocess** (timeout, captured output), `git add/commit` WIP per repo. Never pushes/merges.
+  The single source of "did the tests pass" and "commit the checkpoint" for each repo.
 - **`engine.py` — mission engine.** One background worker thread (respects the single GPU
   slot). Owns the `RUNNING | PAUSED` control flag, the outer loop, the stop condition, the
   per-iteration GPU-call cap, and the inter-iteration cooldown. Reconciles orphaned
@@ -88,20 +122,27 @@ discards the working pipeline.
 **One iteration = one bounded GPU burst + CPU work** (the crash-safe unit):
 
 ```
-a. build context: task + relevant repo files + last test output + prior notes → fit ~64k
+a. build context: goal + constraints + input artifacts + relevant repo files
+                  + last test output + notes → fit ~64k
 b. bounded coder call(s) on GPU: request tools / propose edits      ← the only GPU work
-c. apply edits to the working tree                                   (host)
-d. run_tests() in sandbox → pass/fail + output                       (CPU) ← the oracle
-e. CPU verifier reviews for meaningfulness                            (CPU)
-f. git commit WIP + persist iteration record                         (checkpoint)
+c. apply edits to the working tree(s)                                (host)
+d. evaluate success_criteria: run tests / check artifacts            (CPU) ← the oracle(s)
+e. CPU verifier reviews criteria of type=verifier                    (CPU)
+f. git commit WIP (per repo) + append to notes + persist iteration   (checkpoint)
 g. emit progress → SSE stream (CLI/UI)
-h. STOP if tests all green AND verifier approves → status=done
+h. STOP when ALL success_criteria satisfied → status=done
+   if the coder needs a decision only the user can make → pose question, status=needs_input, park
    else check control flag → if PAUSED, park; else cooldown, loop
 ```
 
 Unbounded in **iterations**, bounded in **GPU work per iteration**. A safety cap (max
 iterations / max wall-time) flips a stuck mission to `needs_input` rather than spinning
 forever.
+
+**Clarifying questions are first-class.** When the coder hits a genuine ambiguity (or a
+`user_approval` criterion is reached), the engine writes `question`, sets `needs_input`, and
+parks — surfacing it in the REPL / UI. Your answer (`wit answer <id> "…"` or inline) folds into
+`notes` and the mission resumes. This reuses the same park/resume machinery as the toggle.
 
 ### Durability, toggle, resume
 
@@ -146,13 +187,15 @@ is how you talk to it. Primary shape is an **interactive REPL**, not a subcomman
   going or done. Claude-Code feel + durable background work.
 - **Slash commands** for control without leaving the session:
   `/new <task> --repo … --test …`, `/ls`, `/tail <id>`, `/pause <id>`, `/resume <id>`,
-  `/cancel <id>`, `/diff <id>`, `/approve <id>`, `/on`, `/off`, `/status`, `/help`, `/clear`.
+  `/cancel <id>`, `/answer <id> "…"` (respond to a needs_input question), `/diff <id>`,
+  `/approve <id>`, `/on`, `/off`, `/status`, `/help`, `/clear`.
 
 **Non-interactive modes** (scripting + headless + tests):
 ```
 wit -p "prompt"                    # one-shot chat/lookup: run, stream to stdout, exit (pipeable)
 wit new "task" --repo PATH --test "CMD" [--detach]   # start a mission non-interactively; prints its id
 wit ls | tail <id> | pause <id> | resume <id> | cancel <id> | diff <id> | approve <id>
+wit answer <id> "..."              # respond to a mission's needs_input question
 wit on | off | status              # direct daemon control (systemd/scripts, no REPL)
 ```
 These are the same operations as the REPL slash commands, exposed as subcommands so scripts and
@@ -187,8 +230,10 @@ stream** from the daemon — the CLI is the reference client that proves the con
 
 ## Build order (phased; each phase testable before the next)
 
-1. **Engine core** — `missions.py` + `workspace.py` + `engine.py` + the outer loop, driven by
-   a temp-repo integration test. No UI, no service yet.
+1. **Engine core** — `missions.py` (the full structured Mission schema; implement
+   `goal / constraints / success_criteria(tests+verifier) / repos(single) / notes / state /
+   iteration`, reserve the rest) + `workspace.py` + `engine.py` + the outer loop, driven by a
+   temp-repo integration test. No UI, no service yet.
 2. **Daemon API + `wit` REPL** — HTTP + SSE endpoints; `wit` interactive REPL (streaming
    tool calls, slash commands) + `wit -p` one-shot as the reference clients. Toggle/resume via
    `wit on/off` and `/on /off`.
