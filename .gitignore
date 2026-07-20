@@ -1,0 +1,19 @@
+# Secrets — NEVER commit. Holds the admin token.
+.orchestrator.env
+*.env
+
+# Runtime data (SQLite jobs/sessions/missions, may contain user content)
+data/
+
+# Python cruft
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor/backup cruft
+*.bak
+*.bak-*
+*~
+
+# Models are symlinked out to /home/nit/extra; never track weights
+*.gguf
