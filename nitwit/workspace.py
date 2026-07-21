@@ -20,6 +20,12 @@ class FileEdit:
     content: str   # full new file content (write_file semantics)
 
 
+@dataclass
+class TestResult:
+    passed: bool
+    output: str
+
+
 def git(repo_path: str, *args: str) -> str:
     proc = subprocess.run(
         ["git", "-C", repo_path, *args],
@@ -62,3 +68,14 @@ class Workspace:
             return ""
         git(self.repo_path, "commit", "-q", "-m", message)
         return git(self.repo_path, "rev-parse", "--short", "HEAD")
+
+    def run_tests(self, cmd: str, timeout: int = 120) -> TestResult:
+        try:
+            proc = subprocess.run(
+                cmd, shell=True, cwd=self.repo_path,
+                capture_output=True, text=True, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return TestResult(False, "TIMEOUT")
+        output = (proc.stdout + proc.stderr).strip()
+        return TestResult(proc.returncode == 0, output)

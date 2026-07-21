@@ -2,7 +2,7 @@ import os
 import subprocess
 import tempfile
 import unittest
-from nitwit.workspace import Workspace, FileEdit, DirtyRepo, UnsafeEditPath, git
+from nitwit.workspace import Workspace, FileEdit, DirtyRepo, UnsafeEditPath, git, TestResult
 
 
 def make_repo() -> str:
@@ -67,6 +67,33 @@ class TestWorkspaceGit(unittest.TestCase):
         self.assertTrue(os.path.exists(nested))
         with open(nested) as fh:
             self.assertEqual(fh.read(), "print('nested')\n")
+
+
+class TestWorkspaceRunTests(unittest.TestCase):
+    def setUp(self):
+        self.repo = make_repo()
+        self.ws = Workspace(self.repo)
+
+    def test_passing_command(self):
+        r = self.ws.run_tests("true")
+        self.assertTrue(r.passed)
+
+    def test_failing_command_captures_output(self):
+        r = self.ws.run_tests("echo boom && false")
+        self.assertFalse(r.passed)
+        self.assertIn("boom", r.output)
+
+    def test_python_test_file(self):
+        with open(os.path.join(self.repo, "check.py"), "w") as fh:
+            fh.write("assert 1 + 1 == 2\nprint('ok')\n")
+        r = self.ws.run_tests("python3 check.py")
+        self.assertTrue(r.passed)
+        self.assertIn("ok", r.output)
+
+    def test_timeout(self):
+        r = self.ws.run_tests("sleep 5", timeout=1)
+        self.assertFalse(r.passed)
+        self.assertIn("TIMEOUT", r.output)
 
 
 if __name__ == "__main__":
