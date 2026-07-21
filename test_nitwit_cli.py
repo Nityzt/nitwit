@@ -160,6 +160,45 @@ class TestCli(unittest.TestCase):
         finally:
             cli.api_call = orig
 
+    def test_interactive_proposes_and_saves_memory(self):
+        import io, os, sys, tempfile
+        from contextlib import redirect_stdout
+        os.environ["NITWIT_MEMORY_DB"] = os.path.join(tempfile.mkdtemp(), "m.db")
+        # stream_answer would hit the model; stub it so the loop reaches the propose step
+        import nitwit.session as S
+        orig = S.stream_answer
+        S.stream_answer = lambda *a, **k: ""
+        old_stdin = sys.stdin
+        sys.stdin = io.StringIO("I use pnpm not npm\ny\n/quit\n")
+        try:
+            from nitwit.memory import MemoryStore
+            with redirect_stdout(io.StringIO()):
+                cli.interactive(self.base, os.getcwd())
+            self.assertTrue(any("pnpm" in f for f in MemoryStore().facts()))
+        finally:
+            S.stream_answer = orig
+            sys.stdin = old_stdin
+            del os.environ["NITWIT_MEMORY_DB"]
+
+    def test_slash_remember_and_forget(self):
+        import io, os, sys, tempfile
+        from contextlib import redirect_stdout
+        os.environ["NITWIT_MEMORY_DB"] = os.path.join(tempfile.mkdtemp(), "m.db")
+        import nitwit.session as S
+        orig = S.stream_answer
+        S.stream_answer = lambda *a, **k: ""
+        old_stdin = sys.stdin
+        sys.stdin = io.StringIO("/remember we use FastAPI\n/memories\n/quit\n")
+        try:
+            from nitwit.memory import MemoryStore
+            with redirect_stdout(io.StringIO()):
+                cli.interactive(self.base, os.getcwd())
+            self.assertTrue(any("FastAPI" in f for f in MemoryStore().facts()))
+        finally:
+            S.stream_answer = orig
+            sys.stdin = old_stdin
+            del os.environ["NITWIT_MEMORY_DB"]
+
 
 if __name__ == "__main__":
     unittest.main()
