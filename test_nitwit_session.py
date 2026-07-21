@@ -412,6 +412,26 @@ class TestStreamAnswerGroundedPrompt(unittest.TestCase):
         self.assertIn("already been run", seen["system"])
 
 
+class TestStripLeadDisclaimer(unittest.TestCase):
+    def test_strips_realtime_hedge_colon_form(self):
+        from nitwit.session import _strip_lead_disclaimer
+        t = ("I can't perform real-time web searches, but I can share the latest information I have "
+             "about One Piece:\n\n- The latest news is here (u)")
+        self.assertEqual(_strip_lead_disclaimer(t), "- The latest news is here (u)")
+
+    def test_strips_realtime_hedge_period_form_and_connector(self):
+        from nitwit.session import _strip_lead_disclaimer
+        t = "I don't have real-time access. However, chapter 1140 is the latest."
+        self.assertEqual(_strip_lead_disclaimer(t), "chapter 1140 is the latest.")
+
+    def test_leaves_ordinary_answer_untouched(self):
+        from nitwit.session import _strip_lead_disclaimer
+        for t in ["Next.js 15 is the latest version. It shipped recently.",
+                  "Chapter 1140 is out now, per the results.",
+                  "The current stable release is 3.14."]:
+            self.assertEqual(_strip_lead_disclaimer(t), t)
+
+
 class TestStreamAnswerNoDirectiveLeak(unittest.TestCase):
     """A parroted SEARCH: on the (search-disabled) re-ask must never leak to the user."""
 

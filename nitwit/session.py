@@ -5,6 +5,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 import subprocess
 import time
 import urllib.request
@@ -129,6 +130,30 @@ def _looks_like_search(s: str) -> bool:
     return "SEARCH:".startswith(s[:7].upper()) if len(s) < 7 else s[:7].upper() == "SEARCH:"
 
 
+# Weak local models prepend a "cutoff/real-time" disclaimer even when handed live results. These
+# phrases, in the FIRST sentence of a grounded answer, mark that hedge — deterministic backstop for
+# the prompt instruction that doesn't reliably suppress it.
+_HEDGE = ("real-time", "real time", "realtime", "knowledge cutoff", "as of my last",
+          "up to my knowledge", "up to my last", "access the internet", "browse the internet",
+          "training data", "last knowledge update", "unable to browse", "can't browse",
+          "cannot browse", "don't have real-time", "do not have real-time",
+          "can't perform real", "cannot perform real")
+
+
+def _strip_lead_disclaimer(text: str) -> str:
+    """Drop a leading hedge sentence (e.g. 'I can't perform real-time web searches, but …') when
+    real content follows. Only touches the FIRST sentence and only if it carries a hedge phrase."""
+    s = text.lstrip()
+    m = re.search(r"[.!?:]\s", s)
+    if not m:
+        return text
+    first, rest = s[: m.end()], s[m.end():]
+    if rest.strip() and any(h in first.lower() for h in _HEDGE):
+        rest = re.sub(r"^(but|however|instead)[,:]?\s+", "", rest.lstrip(), flags=re.IGNORECASE)
+        return rest.lstrip()
+    return text
+
+
 def _stream_and_peek(client, messages, out, parts, allow_search):
     """Stream the model reply.
     - allow_search + reply begins with 'SEARCH:' → return the query (emit nothing).
@@ -244,27 +269,42 @@ def stream_answer(text, repo, *, history=None, out=_default_chunk, _client_facto
     can_search = allow_search and not proactive
     messages = [{"role": "system", "content": _build_system(repo, files, memories, can_search=can_search)}]
     messages.extend(history or [])
+    proactive_results = None
     if proactive:
+        proactive_results = do_search(text)
         messages.append({"role": "system",
-                         "content": "WEB RESULTS (use these for current facts, cite URLs):\n" + do_search(text)})
+                         "content": "WEB RESULTS (use these for current facts, cite URLs):\n" + proactive_results})
         allow_search = False
 
     messages.append({"role": "user", "content": text})
+
+    def grounded_answer(client, msgs, fallback):
+        # Buffer a grounded reply, drop any leading cutoff/real-time disclaimer, then emit once.
+        tmp: list = []
+        _stream_and_peek(client, msgs, lambda s: None, tmp, allow_search=False)
+        answer = _strip_lead_disclaimer("".join(tmp)).strip()
+        if not answer:                                # model gave nothing usable → show raw results
+            answer = fallback
+        if answer:
+            out(answer)
+        return answer
+
     parts = []
     try:
         client = factory(ep.base_url, ep.model, extra_body=ep.extra_body)
-        query = _stream_and_peek(client, messages, out, parts, allow_search)
-        if query is not None:                         # the model asked to search
-            results = do_search(query or text)        # empty model query → fall back to the question
-            # switch system[0] to grounded so the re-ask answers from results, not another SEARCH:
-            messages[0] = {"role": "system",
-                           "content": _build_system(repo, files, memories, can_search=False)}
-            messages.append({"role": "system", "content": "WEB RESULTS (use these, cite URLs):\n" + results})
-            parts.clear()                             # discard the SEARCH: directive text
-            client2 = factory(ep.base_url, ep.model, extra_body=ep.extra_body)
-            _stream_and_peek(client2, messages, out, parts, allow_search=False)  # no more searching
-            if not parts:                             # model only parroted a directive → show results
-                out(results); parts.append(results)
+        if proactive:                                 # results already present → grounded, buffered
+            parts.append(grounded_answer(client, messages, proactive_results or ""))
+        else:
+            query = _stream_and_peek(client, messages, out, parts, allow_search)
+            if query is not None:                     # the model asked to search
+                results = do_search(query or text)    # empty model query → fall back to the question
+                # switch system[0] to grounded so the re-ask answers from results, not another SEARCH:
+                messages[0] = {"role": "system",
+                               "content": _build_system(repo, files, memories, can_search=False)}
+                messages.append({"role": "system", "content": "WEB RESULTS (use these, cite URLs):\n" + results})
+                parts.clear()                         # discard the SEARCH: directive text
+                client2 = factory(ep.base_url, ep.model, extra_body=ep.extra_body)
+                parts.append(grounded_answer(client2, messages, results))
         out("\n")
     except Exception as exc:
         out(f"\n(couldn't reach the model: {exc})\n")
