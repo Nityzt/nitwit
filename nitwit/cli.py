@@ -7,6 +7,7 @@ import json
 import os
 import urllib.request
 from nitwit import session
+from nitwit.memory import MemoryStore, propose_memory
 
 DEFAULT_URL = os.environ.get("NITWIT_URL", "http://127.0.0.1:8807")
 
@@ -185,6 +186,7 @@ def interactive(base, cwd):
     if not session.ensure_daemon(base):
         print("could not start the nitwit daemon; check ~/.local/share/nitwit/daemon.log")
         return
+    mem = MemoryStore()
     repo = session.repo_root(cwd)
     test_cmd = session.detect_test_cmd(repo) if repo else None
     where = repo or f"{cwd} {C['dim']}(not a git repo — tasks need a repo){C['reset']}"
@@ -205,7 +207,8 @@ def interactive(base, cwd):
         if line == "/help":
             print(f"{C['dim']}Talk naturally: a question is answered here; a task "
                   f"('add ...', 'fix ...') runs as a mission on a branch (Ctrl-C detaches).\n"
-                  f"/missions  /diff <id>  /status  /on  /off  /mission <goal>  /clear  /quit{C['reset']}")
+                  f"/missions  /diff <id>  /status  /on  /off  /mission <goal>  /clear  /quit\n"
+                  f"/remember <text>  /memories  /forget <id>{C['reset']}")
             continue
         if line == "/clear":
             history.clear()
@@ -227,17 +230,35 @@ def interactive(base, cwd):
                     print(f"{C['dim']}usage: /export <id> [dest]{C['reset']}"); continue
                 cmd_export(argparse.Namespace(id=parts[1],
                                               dest=(" ".join(parts[2:]) if len(parts) > 2 else None)), base); continue
+            if cmd == "remember" and len(parts) > 1:
+                mem.add(" ".join(parts[1:])); print(f"{C['dim']}(saved){C['reset']}"); continue
+            if cmd == "memories":
+                items = mem.list()
+                print("\n".join(f"{m['id']}. {m['text']}" for m in items)
+                      or f"{C['dim']}(no memories yet){C['reset']}"); continue
+            if cmd == "forget" and len(parts) > 1 and parts[1].isdigit():
+                print(f"{C['dim']}({'forgotten' if mem.delete(int(parts[1])) else 'no such id'}){C['reset']}"); continue
             print(f"{C['dim']}unknown command; /help{C['reset']}"); continue
         if session.classify_intent(line) == "task":
             _start_mission(base, repo, test_cmd, line)
         else:
             print(C["assist"], end="")
-            answer = session.stream_answer(line, repo, history=history)
+            answer = session.stream_answer(line, repo, memories=mem.facts(), history=history)
             print(C["reset"], end="", flush=True)
             # remember the exchange so follow-ups have context (bounded)
             history.append({"role": "user", "content": line})
             history.append({"role": "assistant", "content": answer})
             del history[:-2 * _HISTORY_TURNS]
+            # offer to persist a durable fact the user just stated (approval-gated)
+            cand = propose_memory(line)
+            if cand and cand not in mem.facts():
+                try:
+                    ans = input(f"{C['dim']}remember: \"{cand}\"? [y saves] {C['reset']}").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    ans = ""
+                if ans in ("y", "yes"):
+                    mem.add(cand)
+                    print(f"{C['dim']}(saved){C['reset']}")
 
 
 def build_parser():

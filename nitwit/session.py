@@ -118,9 +118,44 @@ def export_workspace(src, dest):
     return dest
 
 
-def stream_answer(text, repo, *, history=None, out=_default_chunk, _client_factory=None, _endpoint=None, _route=None, allow_search=True, _search_fn=None):
-    """Stream a chat answer on the best-fit CHAT model (router-selected: fast CPU 4B), carrying
-    the conversation `history`. Returns the answer text. Never raises."""
+def _stream_and_peek(client, messages, out, parts, allow_search):
+    """Stream the model reply. If allow_search and the reply begins with 'SEARCH:', return the
+    query string (emitting nothing). Otherwise stream the whole reply to out/parts, return None."""
+    buf = ""
+    committed = False
+    for event in client.stream_chat(messages, temperature=0.2, max_tokens=800):
+        if isinstance(event, dict):
+            chunk = event.get("content", "") if event.get("type") == "chunk" else ""
+        elif isinstance(event, str):
+            chunk = event
+        else:
+            chunk = ""
+        if not chunk:
+            continue
+        if committed:
+            out(chunk); parts.append(chunk); continue
+        buf += chunk
+        s = buf.lstrip()
+        if allow_search and len(s) >= 7 and s[:7].upper() == "SEARCH:":
+            if "\n" in s or len(s) > 160:            # have the full query line
+                return (s[7:].splitlines() or [""])[0].strip()
+            continue                                  # keep buffering the query line
+        if len(s) >= 7:                               # enough to know it's NOT a SEARCH directive
+            committed = True
+            out(buf); parts.append(buf); buf = ""
+    if not committed and buf:                         # short reply below the 7-char threshold
+        s = buf.lstrip()
+        if allow_search and s[:7].upper() == "SEARCH:":
+            return (s[7:].splitlines() or [""])[0].strip()
+        out(buf); parts.append(buf)
+    return None
+
+
+def stream_answer(text, repo, *, history=None, out=_default_chunk, _client_factory=None,
+                  _endpoint=None, _route=None, allow_search=True, _search_fn=None, memories=None):
+    """Stream a chat answer on the router-selected CHAT model. The model can request a web search
+    (SEARCH: <query>); obvious current-info questions search proactively. Recalls `memories`.
+    Never raises; returns the answer text."""
     from orchestrator import OpenAICompatibleClient
     from nitwit.router import route as _default_route
     from nitwit import tools
@@ -133,38 +168,50 @@ def stream_answer(text, repo, *, history=None, out=_default_chunk, _client_facto
             files = ", ".join(sorted(os.listdir(repo))[:40])
         except Exception:
             files = ""
-    system = ("You are Nitwit, a local, self-hosted coding assistant. You run open-source models "
-              "on the user's own machine; you were not created by OpenAI or Anthropic — "
-              "if asked, say you are a local self-hosted assistant."
-              + (f" You are working in the repository at {repo} (top-level entries: {files})." if repo else "")
-              + " Answer directly and briefly, using the conversation so far for context; do not "
-                "contradict earlier answers.")
+    system = (
+        "You are Nitwit, a local, self-hosted coding assistant running open-source models on the "
+        "user's own machine. You were NOT created by OpenAI or Anthropic and you are not GPT-4. "
+        "You CAN look things up on the web: whenever answering needs current or external "
+        "information (latest versions, news, prices, releases, who currently holds a role, or "
+        "anything you are not sure is up to date), reply with EXACTLY `SEARCH: <query>` as your "
+        "entire message and nothing else — the system will run the search and give you the "
+        "results to answer from. Never claim you lack internet access or cannot look things up."
+        + (f" You are working in the repository at {repo} (top-level entries: {files})." if repo else "")
+        + " Otherwise answer directly and briefly, using the conversation so far for context; "
+          "do not contradict earlier answers."
+    )
+    if memories:
+        block = "\n".join(f"- {f}" for f in memories)[:1500]
+        system += "\nKnown facts about the user (honor these):\n" + block
+
     messages = [{"role": "system", "content": system}]
     messages.extend(history or [])
-    if allow_search and tools.needs_web_search(text):
+
+    def do_search(query):
         out("[searching the web…]\n")
         try:
-            results = (_search_fn or tools.web_search)(text)
+            return (_search_fn or tools.web_search)(query)
         except Exception:
-            results = "WEB RESULTS:\n(no results)"  # a search failure must never break the chat
+            return "WEB RESULTS:\n(no results)"
+
+    # proactive fast-path for obvious current-info questions
+    if allow_search and tools.needs_web_search(text):
         messages.append({"role": "system",
-                         "content": "Web search results for the user's question — use these for "
-                                    "current facts and cite the URLs:\n" + results})
+                         "content": "WEB RESULTS (use these for current facts, cite URLs):\n" + do_search(text)})
+        allow_search = False
+
     messages.append({"role": "user", "content": text})
-    parts: list[str] = []
-
-    def emit(s):
-        parts.append(s)
-        out(s)
-
+    parts = []
     try:
         client = factory(ep.base_url, ep.model, extra_body=ep.extra_body)
-        for event in client.stream_chat(messages, temperature=0.2, max_tokens=800):
-            if isinstance(event, dict):
-                if event.get("type") == "chunk":
-                    emit(event.get("content", ""))
-            elif isinstance(event, str):
-                emit(event)
+        query = _stream_and_peek(client, messages, out, parts, allow_search)
+        if query is not None:                         # the model asked to search
+            results = do_search(query or text)        # empty model query → fall back to the question
+            messages.append({"role": "system",
+                             "content": "WEB RESULTS (use these, cite URLs):\n" + results})
+            parts.clear()                             # discard the SEARCH: directive text
+            client2 = factory(ep.base_url, ep.model, extra_body=ep.extra_body)
+            _stream_and_peek(client2, messages, out, parts, allow_search=False)  # no more searching
         out("\n")
     except Exception as exc:
         out(f"\n(couldn't reach the model: {exc})\n")
