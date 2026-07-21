@@ -1,5 +1,7 @@
 import unittest
-from nitwit.missions import Mission, slugify
+import tempfile
+import os
+from nitwit.missions import Mission, slugify, MissionStore, InvalidTransition
 
 
 class TestMissionObject(unittest.TestCase):
@@ -33,6 +35,51 @@ class TestMissionObject(unittest.TestCase):
         self.assertEqual(slugify("Add a /health Endpoint!"), "add-a-health-endpoint")
         self.assertEqual(slugify("  Fix   the BUG  "), "fix-the-bug")
         self.assertTrue(slugify("").startswith("mission"))
+
+
+class TestMissionStore(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.store = MissionStore(os.path.join(self.tmp, "missions.db"))
+
+    def test_create_assigns_id_and_queued(self):
+        m = self.store.create("add health endpoint")
+        self.assertTrue(m.id)
+        self.assertEqual(m.state, "queued")
+        self.assertGreater(m.created, 0)
+
+    def test_get_and_list(self):
+        a = self.store.create("task a")
+        self.store.create("task b")
+        self.assertEqual(self.store.get(a.id).goal, "task a")
+        self.assertEqual(len(self.store.list()), 2)
+        self.assertEqual(len(self.store.list(state="queued")), 2)
+        self.assertEqual(len(self.store.list(state="done")), 0)
+
+    def test_persistence_across_instances(self):
+        m = self.store.create("persist me", success_criteria=[{"type": "verifier", "description": "x"}])
+        reopened = MissionStore(os.path.join(self.tmp, "missions.db"))
+        got = reopened.get(m.id)
+        self.assertEqual(got.success_criteria, [{"type": "verifier", "description": "x"}])
+
+    def test_valid_transition(self):
+        m = self.store.create("t")
+        self.store.set_state(m.id, "running")
+        self.assertEqual(self.store.get(m.id).state, "running")
+
+    def test_invalid_transition_raises(self):
+        m = self.store.create("t")  # queued
+        with self.assertRaises(InvalidTransition):
+            self.store.set_state(m.id, "done")  # queued -> done is illegal
+
+    def test_bump_iteration_and_notes(self):
+        m = self.store.create("t")
+        self.store.bump_iteration(m.id)
+        self.assertEqual(self.store.get(m.id).iteration, 1)
+        self.store.append_note(m.id, "first")
+        self.store.append_note(m.id, "second")
+        self.assertIn("first", self.store.get(m.id).notes)
+        self.assertIn("second", self.store.get(m.id).notes)
 
 
 if __name__ == "__main__":

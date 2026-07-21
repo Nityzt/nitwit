@@ -17,3 +17,4 @@ __pycache__/
 
 # Models are symlinked out to /home/nit/extra; never track weights
 *.gguf
+.superpowers/
