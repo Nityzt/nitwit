@@ -64,6 +64,46 @@ class TestApi(unittest.TestCase):
             _get(self.base + "/missions/nope")
         self.assertEqual(cm.exception.code, 404)
 
+    def test_pause_resume_roundtrip(self):
+        st, m = _post(self.base + "/missions", {"goal": "pause me", "repos": [], "success_criteria": []})
+        self.assertEqual(st, 200)
+        mid = m["id"]
+        st, body = _post(self.base + f"/missions/{mid}/pause")
+        self.assertEqual(st, 200)
+        self.assertEqual(body["state"], "paused")
+        st, body = _post(self.base + f"/missions/{mid}/resume")
+        self.assertEqual(st, 200)
+        self.assertEqual(body["state"], "queued")
+
+    def test_needs_input_answer_roundtrip(self):
+        st, m = _post(self.base + "/missions", {"goal": "answer me", "repos": [], "success_criteria": []})
+        self.assertEqual(st, 200)
+        mid = m["id"]
+        self.daemon.store.set_state(mid, "running")
+        self.daemon.store.set_state(mid, "needs_input")
+        st, body = _post(self.base + f"/missions/{mid}/answer", {"answer": "do X"})
+        self.assertEqual(st, 200)
+        self.assertEqual(body["state"], "queued")
+        self.assertIn("do X", body["notes"])
+
+    def test_cancel(self):
+        st, m = _post(self.base + "/missions", {"goal": "cancel me", "repos": [], "success_criteria": []})
+        self.assertEqual(st, 200)
+        mid = m["id"]
+        st, body = _post(self.base + f"/missions/{mid}/cancel")
+        self.assertEqual(st, 200)
+        self.assertEqual(body["state"], "cancelled")
+
+    def test_wrong_shape_body_returns_400(self):
+        data = json.dumps([1, 2, 3]).encode()
+        req = urllib.request.Request(
+            self.base + "/missions", data=data,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(req, timeout=5)
+        self.assertEqual(cm.exception.code, 400)
+
 
 if __name__ == "__main__":
     unittest.main()

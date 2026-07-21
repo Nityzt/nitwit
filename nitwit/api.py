@@ -55,6 +55,8 @@ def make_server(daemon, port: int = 8807, host: str = "127.0.0.1") -> ThreadingH
                 daemon.turn_off(); return self._json(200, daemon.status())
             if self.path == "/missions":
                 d = self._read_json()
+                if not isinstance(d, dict):
+                    return self._json(400, {"error": "body must be a JSON object"})
                 mission = store.create(d.get("goal", ""), title=d.get("title", ""),
                                        constraints=d.get("constraints"),
                                        success_criteria=d.get("success_criteria"),
@@ -73,7 +75,10 @@ def make_server(daemon, port: int = 8807, host: str = "127.0.0.1") -> ThreadingH
                     elif action == "cancel":
                         store.set_state(mid, "cancelled")
                     elif action == "answer":
-                        store.append_note(mid, "USER ANSWER: " + str(self._read_json().get("answer", "")))
+                        ans_body = self._read_json()
+                        if not isinstance(ans_body, dict):
+                            return self._json(400, {"error": "body must be a JSON object"})
+                        store.append_note(mid, "USER ANSWER: " + str(ans_body.get("answer", "")))
                         store.set_state(mid, "queued")
                 except Exception as exc:
                     return self._json(400, {"error": str(exc)})
