@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field, asdict
@@ -80,12 +81,19 @@ class MissionStore:
 
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
+        # Reentrant so a locked method (e.g. set_state) can call another
+        # locked method (e.g. _require/get, save) on the same thread without
+        # deadlocking. All access to self._conn must go through this lock —
+        # check_same_thread=False only disables Python's assertion, it does
+        # NOT make the connection safe for concurrent use.
+        self._lock = threading.RLock()
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         cols = ", ".join(f"{c} {self._coltype(c)}" for c in self._COLS)
-        # id is the primary key; created/updated stored as REAL so timestamps round-trip as floats
-        self._conn.execute(f"CREATE TABLE IF NOT EXISTS missions ({cols}, PRIMARY KEY (id))")
-        self._conn.commit()
+        with self._lock:
+            # id is the primary key; created/updated stored as REAL so timestamps round-trip as floats
+            self._conn.execute(f"CREATE TABLE IF NOT EXISTS missions ({cols}, PRIMARY KEY (id))")
+            self._conn.commit()
 
     def create(self, goal, *, title="", constraints=None, success_criteria=None, repos=None) -> Mission:
         now = time.time()
@@ -98,50 +106,57 @@ class MissionStore:
         return m
 
     def save(self, m: Mission) -> None:
-        m.updated = time.time()
-        row = m.to_row()
-        placeholders = ", ".join("?" for _ in self._COLS)
-        self._conn.execute(
-            f"INSERT OR REPLACE INTO missions ({', '.join(self._COLS)}) VALUES ({placeholders})",
-            [row[c] for c in self._COLS],
-        )
-        self._conn.commit()
+        with self._lock:
+            m.updated = time.time()
+            row = m.to_row()
+            placeholders = ", ".join("?" for _ in self._COLS)
+            self._conn.execute(
+                f"INSERT OR REPLACE INTO missions ({', '.join(self._COLS)}) VALUES ({placeholders})",
+                [row[c] for c in self._COLS],
+            )
+            self._conn.commit()
 
     def get(self, mission_id) -> Mission | None:
-        cur = self._conn.execute("SELECT * FROM missions WHERE id = ?", (mission_id,))
-        row = cur.fetchone()
-        return Mission.from_row(dict(row)) if row else None
+        with self._lock:
+            cur = self._conn.execute("SELECT * FROM missions WHERE id = ?", (mission_id,))
+            row = cur.fetchone()
+            return Mission.from_row(dict(row)) if row else None
 
     def list(self, state=None) -> list[Mission]:
-        if state:
-            cur = self._conn.execute("SELECT * FROM missions WHERE state = ? ORDER BY created", (state,))
-        else:
-            cur = self._conn.execute("SELECT * FROM missions ORDER BY created")
-        return [Mission.from_row(dict(r)) for r in cur.fetchall()]
+        with self._lock:
+            if state:
+                cur = self._conn.execute("SELECT * FROM missions WHERE state = ? ORDER BY created", (state,))
+            else:
+                cur = self._conn.execute("SELECT * FROM missions ORDER BY created")
+            return [Mission.from_row(dict(r)) for r in cur.fetchall()]
 
     def _require(self, mission_id) -> Mission:
-        m = self.get(mission_id)
-        if m is None:
-            raise InvalidTransition(f"no such mission {mission_id}")
-        return m
+        with self._lock:
+            m = self.get(mission_id)
+            if m is None:
+                raise InvalidTransition(f"no such mission {mission_id}")
+            return m
 
     def set_state(self, mission_id, new_state) -> Mission:
-        m = self._require(mission_id)
-        if new_state != m.state and new_state not in VALID_TRANSITIONS.get(m.state, set()):
-            raise InvalidTransition(f"{m.state} -> {new_state} not allowed")
-        m.state = new_state
-        self.save(m)
-        return m
+        with self._lock:
+            m = self._require(mission_id)
+            if new_state != m.state and new_state not in VALID_TRANSITIONS.get(m.state, set()):
+                raise InvalidTransition(f"{m.state} -> {new_state} not allowed")
+            m.state = new_state
+            self.save(m)
+            return m
 
     def bump_iteration(self, mission_id) -> Mission:
-        m = self._require(mission_id)
-        m.iteration += 1
-        self.save(m)
-        return m
+        with self._lock:
+            m = self._require(mission_id)
+            m.iteration += 1
+            self.save(m)
+            return m
 
     def append_note(self, mission_id, text) -> Mission:
-        m = self._require(mission_id)
-        stamp = time.strftime("%H:%M:%S")
-        m.notes = (m.notes + f"\n[{stamp}] {text}").strip()
-        self.save(m)
-        return m
+        with self._lock:
+            m = self._require(mission_id)
+            stamp = time.strftime("%H:%M:%S")
+            m.notes = (m.notes + f"\n[{stamp}] {text}").strip()
+            self.save(m)
+            return m
