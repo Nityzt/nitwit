@@ -118,44 +118,106 @@ def export_workspace(src, dest):
     return dest
 
 
+def _chunk_text(event) -> str:
+    if isinstance(event, dict):
+        return event.get("content", "") if event.get("type") == "chunk" else ""
+    return event if isinstance(event, str) else ""
+
+
+def _looks_like_search(s: str) -> bool:
+    """True while `s` is (or could still grow into) a leading 'SEARCH:' directive."""
+    return "SEARCH:".startswith(s[:7].upper()) if len(s) < 7 else s[:7].upper() == "SEARCH:"
+
+
 def _stream_and_peek(client, messages, out, parts, allow_search):
-    """Stream the model reply. If allow_search and the reply begins with 'SEARCH:', return the
-    query string (emitting nothing). Otherwise stream the whole reply to out/parts, return None."""
+    """Stream the model reply.
+    - allow_search + reply begins with 'SEARCH:' → return the query (emit nothing).
+    - not allow_search + reply begins with 'SEARCH:' → suppress the directive line and stream only
+      what follows, so a parroted directive from a weak model never leaks to the user.
+    - otherwise stream the whole reply. Returns the search query, or None."""
     buf = ""
     committed = False
     for event in client.stream_chat(messages, temperature=0.2, max_tokens=800):
-        if isinstance(event, dict):
-            chunk = event.get("content", "") if event.get("type") == "chunk" else ""
-        elif isinstance(event, str):
-            chunk = event
-        else:
-            chunk = ""
+        chunk = _chunk_text(event)
         if not chunk:
             continue
         if committed:
             out(chunk); parts.append(chunk); continue
         buf += chunk
         s = buf.lstrip()
-        if allow_search and len(s) >= 7 and s[:7].upper() == "SEARCH:":
-            if "\n" in s or len(s) > 160:            # have the full query line
-                return (s[7:].splitlines() or [""])[0].strip()
-            continue                                  # keep buffering the query line
-        if len(s) >= 7:                               # enough to know it's NOT a SEARCH directive
+        if _looks_like_search(s):
+            if s[:7].upper() != "SEARCH:":            # still a partial prefix ("SEAR") — wait
+                continue
+            if "\n" not in s and len(s) <= 200:        # directive line not finished yet
+                continue
+            query = (s[7:].splitlines() or [""])[0].strip()
+            if allow_search:
+                return query                           # caller runs the search
+            committed = True                           # search disabled: drop the directive line
+            rest = s.split("\n", 1)[1] if "\n" in s else ""
+            buf = ""
+            if rest:
+                out(rest); parts.append(rest)
+            continue
+        if len(s) >= 7:                                # definitely NOT a SEARCH directive
             committed = True
             out(buf); parts.append(buf); buf = ""
-    if not committed and buf:                         # short reply below the 7-char threshold
+    if not committed and buf:                          # stream ended mid-buffer (short/unterminated)
         s = buf.lstrip()
-        if allow_search and s[:7].upper() == "SEARCH:":
-            return (s[7:].splitlines() or [""])[0].strip()
+        if s[:7].upper() == "SEARCH:":
+            query = (s[7:].splitlines() or [""])[0].strip()
+            if allow_search:
+                return query
+            rest = s.split("\n", 1)[1] if "\n" in s else ""   # strip directive, emit any remainder
+            if rest:
+                out(rest); parts.append(rest)
+            return None
         out(buf); parts.append(buf)
     return None
+
+
+def _build_system(repo, files, memories, *, can_search):
+    """The chat system prompt. `can_search` picks the behaviour clause: in *can_search* mode the
+    model is told how to request a search; in *grounded* mode (results already injected) it is told
+    to answer from them and NOT to emit a SEARCH: directive — a weak model otherwise parrots it."""
+    base = (
+        "You are Nitwit, a local, self-hosted coding assistant running open-source models on the "
+        "user's own machine. You were NOT created by OpenAI or Anthropic and you are not GPT-4. "
+        "You have live web access through the host system and can look things up. Never claim you "
+        "lack internet access or cannot look things up."
+    )
+    if can_search:
+        behav = (
+            " Whenever answering needs current or external information (latest versions, news, "
+            "prices, releases, who currently holds a role, or anything you are not sure is up to "
+            "date), reply with EXACTLY `SEARCH: <query>` as your entire message and nothing else — "
+            "the system will run the search and give you the results to answer from. Otherwise "
+            "answer directly and briefly."
+        )
+    else:
+        behav = (
+            " Live web search results are provided in the conversation below — they were fetched "
+            "just now for this question and are current. Answer directly from them and cite the "
+            "source URLs. The search has already been run, so do NOT reply with a SEARCH: directive. "
+            "Do NOT add disclaimers about knowledge cutoffs, training dates, or being unable to "
+            "search in real time — treat the results as present fact and just answer."
+        )
+    repo_clause = (f" You are working in the repository at {repo} (top-level entries: {files})." if repo else "")
+    system = base + behav + repo_clause + (
+        " Use the conversation so far for context; do not contradict earlier answers."
+    )
+    if memories:
+        block = "\n".join(f"- {f}" for f in memories)[:1500]
+        system += "\nKnown facts about the user (honor these):\n" + block
+    return system
 
 
 def stream_answer(text, repo, *, history=None, out=_default_chunk, _client_factory=None,
                   _endpoint=None, _route=None, allow_search=True, _search_fn=None, memories=None):
     """Stream a chat answer on the router-selected CHAT model. The model can request a web search
-    (SEARCH: <query>); obvious current-info questions search proactively. Recalls `memories`.
-    Never raises; returns the answer text."""
+    (SEARCH: <query>); obvious current-info questions search proactively. Whenever results are
+    present the system prompt switches to a *grounded* mode so the model answers from them instead
+    of re-emitting SEARCH:. Recalls `memories`. Never raises; returns the answer text."""
     from orchestrator import OpenAICompatibleClient
     from nitwit.router import route as _default_route
     from nitwit import tools
@@ -168,24 +230,6 @@ def stream_answer(text, repo, *, history=None, out=_default_chunk, _client_facto
             files = ", ".join(sorted(os.listdir(repo))[:40])
         except Exception:
             files = ""
-    system = (
-        "You are Nitwit, a local, self-hosted coding assistant running open-source models on the "
-        "user's own machine. You were NOT created by OpenAI or Anthropic and you are not GPT-4. "
-        "You CAN look things up on the web: whenever answering needs current or external "
-        "information (latest versions, news, prices, releases, who currently holds a role, or "
-        "anything you are not sure is up to date), reply with EXACTLY `SEARCH: <query>` as your "
-        "entire message and nothing else — the system will run the search and give you the "
-        "results to answer from. Never claim you lack internet access or cannot look things up."
-        + (f" You are working in the repository at {repo} (top-level entries: {files})." if repo else "")
-        + " Otherwise answer directly and briefly, using the conversation so far for context; "
-          "do not contradict earlier answers."
-    )
-    if memories:
-        block = "\n".join(f"- {f}" for f in memories)[:1500]
-        system += "\nKnown facts about the user (honor these):\n" + block
-
-    messages = [{"role": "system", "content": system}]
-    messages.extend(history or [])
 
     def do_search(query):
         out("[searching the web…]\n")
@@ -194,8 +238,13 @@ def stream_answer(text, repo, *, history=None, out=_default_chunk, _client_facto
         except Exception:
             return "WEB RESULTS:\n(no results)"
 
-    # proactive fast-path for obvious current-info questions
-    if allow_search and tools.needs_web_search(text):
+    # A proactive search on obvious current-info questions means results are present up front, so
+    # start in grounded mode (no SEARCH: instruction) and disable further searching this turn.
+    proactive = allow_search and tools.needs_web_search(text)
+    can_search = allow_search and not proactive
+    messages = [{"role": "system", "content": _build_system(repo, files, memories, can_search=can_search)}]
+    messages.extend(history or [])
+    if proactive:
         messages.append({"role": "system",
                          "content": "WEB RESULTS (use these for current facts, cite URLs):\n" + do_search(text)})
         allow_search = False
@@ -207,11 +256,15 @@ def stream_answer(text, repo, *, history=None, out=_default_chunk, _client_facto
         query = _stream_and_peek(client, messages, out, parts, allow_search)
         if query is not None:                         # the model asked to search
             results = do_search(query or text)        # empty model query → fall back to the question
-            messages.append({"role": "system",
-                             "content": "WEB RESULTS (use these, cite URLs):\n" + results})
+            # switch system[0] to grounded so the re-ask answers from results, not another SEARCH:
+            messages[0] = {"role": "system",
+                           "content": _build_system(repo, files, memories, can_search=False)}
+            messages.append({"role": "system", "content": "WEB RESULTS (use these, cite URLs):\n" + results})
             parts.clear()                             # discard the SEARCH: directive text
             client2 = factory(ep.base_url, ep.model, extra_body=ep.extra_body)
             _stream_and_peek(client2, messages, out, parts, allow_search=False)  # no more searching
+            if not parts:                             # model only parroted a directive → show results
+                out(results); parts.append(results)
         out("\n")
     except Exception as exc:
         out(f"\n(couldn't reach the model: {exc})\n")

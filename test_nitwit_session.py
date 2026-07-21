@@ -349,3 +349,127 @@ class TestStreamAnswerIdentityCopy(unittest.TestCase):
         self.assertNotIn("no internet", system.lower())  # never claims it lacks internet access
         self.assertIn("not GPT-4", system)                # explicit denial (see report: contains
                                                             # the substring "GPT-4" by design)
+
+
+class TestStreamAnswerGroundedPrompt(unittest.TestCase):
+    """When results are already injected, the system prompt must NOT keep telling the model to
+    emit SEARCH: — a weak model parrots the directive instead of answering (real bug from Image #6)."""
+
+    def test_proactive_search_switches_to_grounded_prompt(self):
+        from nitwit import session
+        from nitwit.router import Endpoint
+
+        seen = {}
+
+        class FakeClient:
+            def __init__(self, *a, **k): pass
+            def stream_chat(self, messages, *, temperature, max_tokens, response_format=None):
+                seen["system"] = messages[0]["content"]
+                yield {"type": "chunk", "content": "Next.js 15, per the results."}
+                yield {"type": "done"}
+
+        ep = Endpoint("http://x", "m", {})
+        session.stream_answer("what's the latest next.js version?", None, _endpoint=ep,
+                              out=lambda s: None,
+                              _client_factory=lambda u, m, extra_body=None: FakeClient(),
+                              _search_fn=lambda q: "WEB RESULTS:\n- x (u)")
+        sys = seen["system"]
+        self.assertNotIn("reply with EXACTLY", sys)     # no can-search directive when grounded
+        self.assertIn("already been run", sys)          # grounded framing present
+        self.assertIn("Nitwit", sys)
+
+    def test_model_decided_search_rebuilds_grounded_for_reask(self):
+        from nitwit import session
+        from nitwit.router import Endpoint
+
+        calls = {"n": 0}
+        seen = {}
+
+        class C1:
+            def __init__(self, *a, **k): pass
+            def stream_chat(self, messages, *, temperature, max_tokens, response_format=None):
+                # first turn is allowed to search
+                assert "reply with EXACTLY" in messages[0]["content"]
+                yield {"type": "chunk", "content": "SEARCH: latest next.js\n"}
+                yield {"type": "done"}
+
+        class C2:
+            def __init__(self, *a, **k): pass
+            def stream_chat(self, messages, *, temperature, max_tokens, response_format=None):
+                seen["system"] = messages[0]["content"]
+                yield {"type": "chunk", "content": "It's v15"}
+                yield {"type": "done"}
+
+        def factory(u, m, extra_body=None):
+            calls["n"] += 1
+            return C1() if calls["n"] == 1 else C2()
+
+        ep = Endpoint("http://x", "m", {})
+        ans = session.stream_answer("tell me more", None, _endpoint=ep, out=lambda s: None,
+                                    _client_factory=factory, _search_fn=lambda q: "WEB RESULTS:\n- x (u)")
+        self.assertEqual(ans, "It's v15")
+        self.assertNotIn("reply with EXACTLY", seen["system"])   # re-ask prompt is grounded
+        self.assertIn("already been run", seen["system"])
+
+
+class TestStreamAnswerNoDirectiveLeak(unittest.TestCase):
+    """A parroted SEARCH: on the (search-disabled) re-ask must never leak to the user."""
+
+    def test_parroted_directive_stripped_on_reask(self):
+        from nitwit import session
+        from nitwit.router import Endpoint
+
+        calls = {"n": 0}
+
+        class C1:
+            def __init__(self, *a, **k): pass
+            def stream_chat(self, messages, *, temperature, max_tokens, response_format=None):
+                yield {"type": "chunk", "content": "SEARCH: one piece\n"}
+                yield {"type": "done"}
+
+        class C2:  # weak model still parrots a directive line, then gives the real answer
+            def __init__(self, *a, **k): pass
+            def stream_chat(self, messages, *, temperature, max_tokens, response_format=None):
+                yield {"type": "chunk", "content": "SEARCH: one piece again\nChapter 1140 is the latest."}
+                yield {"type": "done"}
+
+        def factory(u, m, extra_body=None):
+            calls["n"] += 1
+            return C1() if calls["n"] == 1 else C2()
+
+        out = []
+        ep = Endpoint("http://x", "m", {})
+        ans = session.stream_answer("tell me more", None, _endpoint=ep, out=out.append,
+                                    _client_factory=factory, _search_fn=lambda q: "WEB RESULTS:\n- x (u)")
+        self.assertNotIn("SEARCH:", ans)
+        self.assertNotIn("SEARCH:", "".join(out))
+        self.assertIn("Chapter 1140 is the latest.", ans)
+
+    def test_pure_parroted_directive_falls_back_to_results(self):
+        from nitwit import session
+        from nitwit.router import Endpoint
+
+        calls = {"n": 0}
+
+        class C1:
+            def __init__(self, *a, **k): pass
+            def stream_chat(self, messages, *, temperature, max_tokens, response_format=None):
+                yield {"type": "chunk", "content": "SEARCH: one piece\n"}
+                yield {"type": "done"}
+
+        class C2:  # model emits ONLY a directive on the re-ask — nothing usable
+            def __init__(self, *a, **k): pass
+            def stream_chat(self, messages, *, temperature, max_tokens, response_format=None):
+                yield {"type": "chunk", "content": "SEARCH: one piece again\n"}
+                yield {"type": "done"}
+
+        def factory(u, m, extra_body=None):
+            calls["n"] += 1
+            return C1() if calls["n"] == 1 else C2()
+
+        ep = Endpoint("http://x", "m", {})
+        ans = session.stream_answer("tell me more", None, _endpoint=ep, out=lambda s: None,
+                                    _client_factory=factory,
+                                    _search_fn=lambda q: "WEB RESULTS:\n- Latest: chapter 1140 (u)")
+        self.assertNotIn("SEARCH:", ans)
+        self.assertIn("1140", ans)                       # fell back to the raw results, not blank
