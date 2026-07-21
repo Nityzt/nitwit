@@ -95,7 +95,8 @@ class TestAnswerWebLoop(unittest.TestCase):
                                    route=lambda s: _route(s, gpu=True), factory=self._factory(client),
                                    search=lambda q, limit=6: "WEB RESULTS:\n- a (https://a/x)",
                                    fetch=lambda u: "1140 is the latest chapter",
-                                   sleep=slept.append, warmup=lambda c: warmed.append(1) or True)
+                                   sleep=slept.append, warmup=lambda c: warmed.append(1) or True,
+                                   gpu_ok=lambda: True)
         self.assertIn("1140", ans)
         self.assertEqual(len(client.calls), 2)              # synth + verify, no correction
         self.assertEqual(len(slept), 1)                     # one cooldown (before the verify prefill)
@@ -111,7 +112,7 @@ class TestAnswerWebLoop(unittest.TestCase):
                                    route=lambda s: _route(s, gpu=True), factory=self._factory(client),
                                    search=lambda q, limit=6: "WEB RESULTS:\n- a (https://a/x)",
                                    fetch=lambda u: "chapter 1187", sleep=slept.append,
-                                   warmup=lambda c: True)
+                                   warmup=lambda c: True, gpu_ok=lambda: True)
         self.assertEqual(len(client.calls), 4)              # synth, verify, correct, verify
         self.assertEqual(len(slept), 3)                     # cooldown before each GPU prefill after #1
         self.assertNotIn("July 5", ans)
@@ -124,7 +125,7 @@ class TestAnswerWebLoop(unittest.TestCase):
                                    route=lambda s: _route(s, gpu=True), factory=self._factory(client),
                                    search=lambda q, limit=6: "WEB RESULTS:\n- a (https://a/x)",
                                    fetch=lambda u: "text", max_iters=2, sleep=slept.append,
-                                   warmup=lambda c: True)
+                                   warmup=lambda c: True, gpu_ok=lambda: True)
         self.assertEqual(len(client.calls), 4)              # synth, verify, correct, verify → stop
         self.assertTrue(ans)                                # returns best-effort, not blank
 
@@ -148,8 +149,46 @@ class TestAnswerWebLoop(unittest.TestCase):
                                    factory=lambda *a, **k: Boom(),
                                    search=lambda q, limit=6: (_ for _ in ()).throw(RuntimeError()),
                                    fetch=lambda u: (_ for _ in ()).throw(RuntimeError()),
-                                   warmup=lambda c: False)
+                                   warmup=lambda c: False, gpu_ok=lambda: True)
         self.assertIsInstance(ans, str)
+
+    def test_gpu_gated_to_cpu_when_undervolt_absent(self):
+        # synth routes to GPU (8080), but CoreCtrl undervolt is NOT applied → must fall back to the
+        # CPU model (8086): no warm-up, no cooldown, and the client is built for the CPU endpoint.
+        client = _Client(["answer (https://a/x)", _claims(("x", True))])
+        seen_urls, slept, warmed = [], [], []
+        def factory(url, model, extra_body=None):
+            seen_urls.append(url)
+            return client
+        webanswer.answer_web("q", out=lambda s: None,
+                             route=lambda s: _route(s, gpu=True), factory=factory,
+                             search=lambda q, limit=6: "WEB RESULTS:\n- a (https://a/x)",
+                             fetch=lambda u: "text", sleep=slept.append,
+                             warmup=lambda c: warmed.append(1) or True,
+                             gpu_ok=lambda: False)                 # no undervolt
+        self.assertTrue(all("8086" in u for u in seen_urls))      # never built a GPU client
+        self.assertEqual(warmed, [])                              # CPU path → no warm-up
+        self.assertEqual(slept, [])                               # CPU path → no cooldown
+
+
+class TestGpuUndervoltActive(unittest.TestCase):
+    def test_true_when_corectrl_running(self):
+        self.assertTrue(webanswer._gpu_undervolt_active(_probe=lambda: True))
+
+    def test_false_when_corectrl_absent(self):
+        self.assertFalse(webanswer._gpu_undervolt_active(_probe=lambda: False))
+
+    def test_env_override_forces_true(self):
+        import os
+        os.environ["NITWIT_GPU_UNPROTECTED_OK"] = "1"
+        try:
+            self.assertTrue(webanswer._gpu_undervolt_active(_probe=lambda: False))
+        finally:
+            del os.environ["NITWIT_GPU_UNPROTECTED_OK"]
+
+    def test_never_raises(self):
+        def boom(): raise RuntimeError("x")
+        self.assertFalse(webanswer._gpu_undervolt_active(_probe=boom))
 
 
 if __name__ == "__main__":
