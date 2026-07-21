@@ -1,35 +1,57 @@
-"""Grounded web-answer pipeline: search → fetch pages → synthesize (GPU 7B) → verify grounding
-(CPU 4B) → correct once (GPU) or hedge (CPU) → clean. Bounded — never a GPU tool-loop:
+"""Grounded web-answer loop: search → fetch pages → synthesize → verify grounding → self-correct,
+repeating until the answer is grounded in the fetched sources or the iteration budget runs out.
 
-  * at most TWO 7B prefills per answer (synthesis + at most one correction), never a loop;
-  * a cooldown between the two prefills so they stay isolated single prefills (the RX 580 faults on
-    sustained back-to-back prefills, not on single ones);
-  * the whole thing runs on the CPU 4B if llama:8080 is down, and NITWIT_WEB_SYNTH=cpu forces it.
+Design goals (per the Nitwit vision): a general self-correcting research loop that returns an
+accurate, source-grounded answer regardless of latency. No hardcoded fact/date/number gates — the
+verifier is a model judging the answer against the fetched CONTEXT, and correction is another
+synthesis pass, so the same machinery works for any topic.
 
-Every function returns a safe value on failure; `answer_web` NEVER raises and always emits something.
+GPU safety (RX 580): synthesis may run on the GPU 7B (route('synth')). The card hard-faults on a
+cold compute submission and on sustained back-to-back prefills, so this module (a) warms the GPU
+with a tiny prefill before the first real synthesis, and (b) sleeps a cooldown between successive
+GPU prefills, keeping each as an isolated single prefill (proven power-flat at the 927MHz lock).
+If the synth endpoint is the CPU model, warm-up and cooldown are skipped. Every function returns a
+safe value on failure; `answer_web` NEVER raises.
 """
 from __future__ import annotations
 
-import os
 import re
 import time
 
+_MAX_CONTEXT = 6000
+
 _GROUNDING_SYSTEM = (
     "You are Nitwit, a local self-hosted assistant with live web access. Answer the user's question "
-    "ONLY using the CONTEXT below, which was fetched from the web just now and is current. Cite the "
-    "source URLs inline. If CONTEXT does not contain a specific fact the user asked for — an exact "
-    "number, date, version, chapter/episode number, or name — say plainly that the sources don't "
-    "state it rather than guessing or inventing one. Do NOT add disclaimers about knowledge cutoffs, "
-    "training dates, or being unable to search in real time; treat CONTEXT as present fact."
+    "using ONLY the CONTEXT below, which was fetched from the web moments ago and is current. "
+    "Ground every specific — each number, date, version, name, quantity — in CONTEXT: state a "
+    "specific ONLY if that exact value appears in CONTEXT. If CONTEXT does not contain a specific "
+    "the user asked for, say plainly that the sources don't state it; never guess, infer, estimate, "
+    "or invent one (especially dates). Cite the source URLs inline. Do NOT add disclaimers about "
+    "knowledge cutoffs, training dates, or being unable to search in real time; treat CONTEXT as "
+    "present fact."
+)
+
+# The verifier enumerates each specific claim and judges it against CONTEXT, quoting the supporting
+# text. Enumerate-and-quote is far steadier than "list the unsupported ones" on a small model.
+_VERIFY_SYSTEM = (
+    "You verify an ANSWER against CONTEXT. Enumerate EVERY specific factual token in ANSWER — each "
+    "number, date, version, chapter/episode number, name, quantity, or superlative ('the latest', "
+    "'the newest'). For each, search CONTEXT for the exact value: put the supporting CONTEXT "
+    "substring in \"quote\" and set supported=true ONLY if such a substring truly exists; otherwise "
+    "set supported=false and quote=\"\". A date/number is supported only if that exact value appears "
+    "in CONTEXT. Judge only against CONTEXT, never prior knowledge. Return JSON only."
 )
 
 _VERIFY_FORMAT = {"type": "json_schema", "json_schema": {"name": "grounding", "schema": {
     "type": "object",
-    "properties": {"unsupported": {"type": "array", "items": {"type": "string"}}},
-    "required": ["unsupported"],
+    "properties": {"claims": {"type": "array", "items": {
+        "type": "object",
+        "properties": {"claim": {"type": "string"}, "quote": {"type": "string"},
+                       "supported": {"type": "boolean"}},
+        "required": ["claim", "supported"],
+    }}},
+    "required": ["claims"],
 }}}
-
-_MAX_CONTEXT = 6000
 
 
 def _content(resp) -> str:
@@ -44,9 +66,10 @@ def synthesize(query: str, context: str, *, client, correction=None) -> str:
     ]
     if correction:
         messages.append({"role": "system",
-                         "content": "Your previous answer contained statements NOT supported by "
-                                    "CONTEXT. Remove them, or replace them only with facts actually "
-                                    "present in CONTEXT. Unsupported statements:\n"
+                         "content": "Your previous answer stated these specifics that are NOT "
+                                    "supported by CONTEXT. Remove each one, or replace it only with a "
+                                    "value that actually appears in CONTEXT. If CONTEXT has no such "
+                                    "value, say the sources don't state it. Unsupported:\n"
                                     + "\n".join(f"- {c}" for c in correction)})
     messages.append({"role": "user", "content": query})
     try:
@@ -56,46 +79,30 @@ def synthesize(query: str, context: str, *, client, correction=None) -> str:
 
 
 def verify_grounding(answer: str, context: str, *, client) -> list[str]:
-    """Return the specific claims in `answer` NOT supported by `context`. Fails OPEN: any error or
-    malformed output yields [] so a flaky verifier never blocks a usable answer."""
+    """Return the specific claims in `answer` NOT supported by `context`, via an enumerate-and-quote
+    model check. Fails OPEN: any error/malformed output yields [] so a flaky verifier never blocks
+    a usable answer (the loop simply stops correcting)."""
     if not (answer or "").strip():
         return []
     messages = [
-        {"role": "system",
-         "content": "You check whether an ANSWER is grounded in CONTEXT. List every specific factual "
-                    "claim in ANSWER — exact numbers, dates, versions, chapter/episode numbers, names "
-                    "— that is NOT explicitly supported by CONTEXT. If every specific claim is "
-                    "supported, return an empty list. Return JSON only."},
+        {"role": "system", "content": _VERIFY_SYSTEM},
         {"role": "system", "content": "CONTEXT:\n" + (context or "")[:_MAX_CONTEXT]},
         {"role": "user", "content": "ANSWER:\n" + answer},
     ]
     try:
         from orchestrator import extract_json
-        resp = client.chat(messages, temperature=0.0, max_tokens=300, response_format=_VERIFY_FORMAT)
+        resp = client.chat(messages, temperature=0.0, max_tokens=600, response_format=_VERIFY_FORMAT)
         data = extract_json(_content(resp))
-        items = data.get("unsupported") if isinstance(data, dict) else None
-        if isinstance(items, list):
-            return [str(x).strip() for x in items if str(x).strip()]
+        claims = data.get("claims") if isinstance(data, dict) else None
+        if isinstance(claims, list):
+            return [str(c.get("claim", "")).strip() for c in claims
+                    if isinstance(c, dict) and c.get("supported") is False and str(c.get("claim", "")).strip()]
     except Exception:
         pass
     return []
 
 
-def _hedge(answer: str, unsupported: list[str]) -> str:
-    """CPU fallback: drop sentences carrying an unsupported specific (a number or 'Month DD')."""
-    bad = set()
-    for u in unsupported:
-        for tok in re.findall(r"\b\d[\d.,/:-]*\b|\b[A-Z][a-z]+ \d{1,2}\b", u):
-            bad.add(tok.lower())
-    if not bad:
-        return answer
-    kept = [s for s in re.split(r"(?<=[.!?])\s+|\n", answer) if not any(t in s.lower() for t in bad)]
-    out = " ".join(s for s in kept if s.strip()).strip()
-    return out or ("The sources I found don't state those specifics — you may want to open the cited "
-                   "pages directly.")
-
-
-def clean(answer: str, sources=None) -> str:
+def clean(answer: str) -> str:
     """Drop any leading cutoff/real-time disclaimer, collapse whitespace. Returns tidy text."""
     from nitwit.session import _strip_lead_disclaimer
     text = _strip_lead_disclaimer(answer or "").strip()
@@ -103,46 +110,64 @@ def clean(answer: str, sources=None) -> str:
     return "\n".join(line.rstrip() for line in text.splitlines()).strip()
 
 
+def _warmup(client) -> bool:
+    """Wake a cold GPU with a tiny prefill before the first real synthesis (cold-start guard).
+    Returns True if the endpoint responded. Never raises."""
+    try:
+        client.chat([{"role": "user", "content": "Reply with: ok"}], temperature=0.0, max_tokens=2)
+        return True
+    except Exception:
+        return False
+
+
 def answer_web(query, *, out, route, factory, search=None, fetch=None,
-               cooldown=2.5, sleep=None, allow_gpu_correct=True):
-    """Run the full grounded pipeline for `query`, streaming a '[searching…]' note then the final
-    answer to `out`. Returns the answer text. NEVER raises; degrades to the raw results worst-case."""
+               max_iters=3, cooldown=2.0, sleep=None, warmup=None):
+    """Search, fetch pages, then synthesize and self-correct in a loop until the answer is grounded
+    in CONTEXT or `max_iters` verification passes are spent. Streams a '[searching…]' note then the
+    final answer to `out`; returns the answer text. NEVER raises.
+
+    GPU: if route('synth') resolves to the GPU, warms it once and sleeps `cooldown` between
+    successive GPU synthesis prefills. On the CPU model both are skipped.
+    """
     sleep = sleep or time.sleep
+    warmup = warmup or _warmup
     from nitwit import tools
     out("[searching the web…]\n")
     ctx = tools.gather_context(query, _search=search, _fetch=fetch)
-    context, sources = ctx["context"], ctx["sources"]
+    context = ctx["context"]
 
-    force_cpu = os.environ.get("NITWIT_WEB_SYNTH", "").lower() == "cpu"
-    try:
-        synth_ep = route("chat" if force_cpu else "synth")
-    except Exception:
-        synth_ep = route("chat")
-    on_gpu = (not force_cpu) and "8080" in synth_ep.base_url
+    synth_ep = route("synth")
+    on_gpu = "8080" in synth_ep.base_url
     client = factory(synth_ep.base_url, synth_ep.model, extra_body=synth_ep.extra_body)
+    if on_gpu:
+        warmup(client)                                   # cold-start guard
 
-    answer = synthesize(query, context, client=client)
+    # Synthesis AND verification run on the same model: the 7B is a markedly more reliable judge
+    # than the 4B (bench: 87.5% vs 75%) and, on the GPU, fast enough to loop. A cooldown before
+    # every GPU prefill keeps each an isolated single prefill (the card faults on sustained
+    # back-to-back prefills, not on isolated ones).
+    def gpu_gap():
+        if on_gpu:
+            sleep(cooldown)
 
-    try:
-        ver_ep = route("verify")
-        vclient = factory(ver_ep.base_url, ver_ep.model, extra_body=ver_ep.extra_body)
-        unsupported = verify_grounding(answer, context, client=vclient)
-    except Exception:
-        unsupported = []
+    answer = synthesize(query, context, client=client)   # prefill #1
+    checks = 0
+    while checks < max_iters:
+        gpu_gap()
+        unsupported = verify_grounding(answer, context, client=client)   # prefill
+        checks += 1
+        if not unsupported:
+            break                                        # grounded → done
+        if checks >= max_iters:
+            break                                        # correction budget spent; keep best effort
+        gpu_gap()
+        corrected = synthesize(query, context, client=client, correction=unsupported)  # prefill
+        if not corrected.strip():
+            break                                        # correction failed; keep prior answer
+        answer = corrected
 
-    if unsupported:
-        if on_gpu and allow_gpu_correct:
-            sleep(cooldown)                       # keep the 2 GPU prefills as isolated singles
-            corrected = synthesize(query, context, client=client, correction=unsupported)
-            if corrected.strip():
-                answer = corrected                # bounded: no re-verify, no loop
-            else:
-                answer = _hedge(answer, unsupported)
-        else:
-            answer = _hedge(answer, unsupported)  # CPU path: no GPU prefill
-
-    final = clean(answer, sources)
+    final = clean(answer)
     if not final:
-        final = (ctx["results"] or "(no results)")   # worst case: show the raw results
+        final = ctx["results"] or "(no results)"         # worst case: show the raw results
     out(final)
     return final

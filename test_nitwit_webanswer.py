@@ -1,3 +1,4 @@
+import json
 import unittest
 from nitwit import webanswer
 from nitwit.router import Endpoint
@@ -8,7 +9,7 @@ class _Resp:
 
 
 class _Client:
-    """Fake non-streaming chat client. `script` maps call-index -> content string."""
+    """Fake non-streaming chat client. Pops `replies` in order; records calls."""
     def __init__(self, replies):
         self._replies = list(replies)
         self.calls = []
@@ -18,6 +19,11 @@ class _Client:
         return _Resp(self._replies.pop(0) if self._replies else "")
 
 
+def _claims(*pairs):
+    """Build a verifier JSON payload from (claim, supported) pairs."""
+    return json.dumps({"claims": [{"claim": c, "supported": s, "quote": ""} for c, s in pairs]})
+
+
 class TestSynthesize(unittest.TestCase):
     def test_uses_context_and_query(self):
         c = _Client(["Chapter 1140 is the latest (https://viz.com)."])
@@ -25,7 +31,7 @@ class TestSynthesize(unittest.TestCase):
         self.assertEqual(out, "Chapter 1140 is the latest (https://viz.com).")
         joined = "\n".join(m["content"] for m in c.calls[0])
         self.assertIn("CONTEXT text 1140", joined)
-        self.assertIn("ONLY using the CONTEXT", joined)
+        self.assertIn("using ONLY the CONTEXT", joined)
 
     def test_never_raises(self):
         class Boom:
@@ -34,14 +40,16 @@ class TestSynthesize(unittest.TestCase):
 
 
 class TestVerifyGrounding(unittest.TestCase):
-    def test_returns_unsupported_list(self):
-        c = _Client(['{"unsupported": ["chapter 1187", "July 5 2026"]}'])
-        self.assertEqual(webanswer.verify_grounding("ans", "ctx", client=c),
-                         ["chapter 1187", "July 5 2026"])
+    def test_returns_unsupported_claims_only(self):
+        c = _Client([_claims(("chapter 1187", True), ("July 5 2026", False))])
+        self.assertEqual(webanswer.verify_grounding("ans", "ctx", client=c), ["July 5 2026"])
+
+    def test_all_supported_returns_empty(self):
+        c = _Client([_claims(("1140", True))])
+        self.assertEqual(webanswer.verify_grounding("ans", "ctx", client=c), [])
 
     def test_fails_open_on_garbage(self):
-        c = _Client(["not json at all"])
-        self.assertEqual(webanswer.verify_grounding("ans", "ctx", client=c), [])
+        self.assertEqual(webanswer.verify_grounding("ans", "ctx", client=_Client(["not json"])), [])
 
     def test_fails_open_on_exception(self):
         class Boom:
@@ -49,103 +57,99 @@ class TestVerifyGrounding(unittest.TestCase):
         self.assertEqual(webanswer.verify_grounding("ans", "ctx", client=Boom()), [])
 
     def test_empty_answer_short_circuits(self):
-        c = _Client(['{"unsupported": ["x"]}'])
+        c = _Client([_claims(("x", False))])
         self.assertEqual(webanswer.verify_grounding("   ", "ctx", client=c), [])
-        self.assertEqual(c.calls, [])  # no model call for an empty answer
+        self.assertEqual(c.calls, [])
 
 
-class TestHedgeAndClean(unittest.TestCase):
-    def test_hedge_drops_sentence_with_unsupported_number(self):
-        ans = "Chapter 1187 releases July 5, 2026. You can read it free on VIZ."
-        out = webanswer._hedge(ans, ["chapter 1187", "July 5, 2026"])
-        self.assertNotIn("1187", out)
-        self.assertIn("VIZ", out)
-
+class TestCleanAndWarmup(unittest.TestCase):
     def test_clean_strips_lead_disclaimer(self):
         out = webanswer.clean("I can't perform real-time web searches, but chapter 1140 is out.\n\n\n")
         self.assertNotIn("real-time", out)
         self.assertIn("1140", out)
 
+    def test_warmup_true_on_success_false_on_error(self):
+        self.assertTrue(webanswer._warmup(_Client(["ok"])))
+        class Boom:
+            def chat(self, *a, **k): raise RuntimeError("cold")
+        self.assertFalse(webanswer._warmup(Boom()))
 
-def _route(stage, *, gpu_up=True, cpu_up=True, health=None):
-    # returns synth->8080 when gpu_up, else chat->8086; verify->8086
-    if stage in ("synth", "code"):
-        return Endpoint("http://127.0.0.1:8080", "coder", {}) if gpu_up else Endpoint("http://127.0.0.1:8086", "4b", {})
-    return Endpoint("http://127.0.0.1:8086", "4b", {})
+
+def _route(stage, *, gpu=True):
+    if stage == "synth":
+        return Endpoint("http://127.0.0.1:8080" if gpu else "http://127.0.0.1:8086", "synth", {})
+    return Endpoint("http://127.0.0.1:8086", "4b", {})   # verify
 
 
-class TestAnswerWeb(unittest.TestCase):
-    def _search(self, q, limit=6):
-        return "WEB RESULTS:\n- A: blurb (https://a.example/x)"
+class TestAnswerWebLoop(unittest.TestCase):
+    """One model does both synth and verify; its `replies` interleave answers and verifier JSON in
+    call order: [answer, verify, (corrected, verify)...]."""
 
-    def _fetch(self, u):
-        return "chapter 1140 is the current latest chapter"
+    def _factory(self, client):
+        return lambda url, model, extra_body=None: client
 
-    def test_clean_answer_passes_through_no_correction(self):
-        # synth -> good answer; verify -> no unsupported. Exactly one synth call, no cooldown.
-        clients = {}
-        def factory(url, model, extra_body=None):
-            # synth client (8080) then verify client (8086)
-            c = _Client(["Chapter 1140 is the latest (https://a.example/x)."]) if "8080" in url \
-                else _Client(['{"unsupported": []}'])
-            clients.setdefault(url, c)
-            return clients[url]
-        slept = []
-        out = []
-        ans = webanswer.answer_web("latest chapter?", out=out.append,
-                                   route=lambda s: _route(s, gpu_up=True),
-                                   factory=factory, search=self._search, fetch=self._fetch,
-                                   sleep=slept.append)
+    def test_grounded_first_pass_no_correction(self):
+        client = _Client(["Chapter 1140 is the latest (https://a/x).", _claims(("1140", True))])
+        slept, warmed = [], []
+        ans = webanswer.answer_web("latest chapter?", out=lambda s: None,
+                                   route=lambda s: _route(s, gpu=True), factory=self._factory(client),
+                                   search=lambda q, limit=6: "WEB RESULTS:\n- a (https://a/x)",
+                                   fetch=lambda u: "1140 is the latest chapter",
+                                   sleep=slept.append, warmup=lambda c: warmed.append(1) or True)
         self.assertIn("1140", ans)
-        self.assertEqual(slept, [])                       # no correction → no cooldown
-        self.assertEqual(len(clients["http://127.0.0.1:8080"].calls), 1)  # one GPU prefill
+        self.assertEqual(len(client.calls), 2)              # synth + verify, no correction
+        self.assertEqual(len(slept), 1)                     # one cooldown (before the verify prefill)
+        self.assertEqual(warmed, [1])                       # GPU warmed once
 
-    def test_unsupported_triggers_exactly_one_gpu_correction_with_cooldown(self):
-        gpu = _Client(["Chapter 1187 releases July 5 (https://a.example/x).",  # synth (wrong)
-                       "The sources don't give an exact chapter number (https://a.example/x)."])  # correction
-        ver = _Client(['{"unsupported": ["chapter 1187"]}'])
-        def factory(url, model, extra_body=None):
-            return gpu if "8080" in url else ver
-        slept = []
-        out = []
-        ans = webanswer.answer_web("latest chapter?", out=out.append,
-                                   route=lambda s: _route(s, gpu_up=True),
-                                   factory=factory, search=self._search, fetch=self._fetch,
-                                   sleep=slept.append)
-        self.assertEqual(len(gpu.calls), 2)               # synth + exactly one correction, no loop
-        self.assertEqual(len(slept), 1)                   # cooldown between the two prefills
-        self.assertNotIn("1187", ans)
-
-    def test_cpu_path_hedges_without_gpu_prefill(self):
-        # gpu_up=False → synth resolves to CPU (8086). Unsupported → hedge, never a GPU call.
-        cpu = _Client(["Chapter 1187 releases July 5. You can read it on VIZ (https://a.example/x)."])
-        ver = _Client(['{"unsupported": ["chapter 1187", "July 5"]}'])
-        calls = {"cpu": 0}
-        def factory(url, model, extra_body=None):
-            # both synth-fallback and verify land on 8086; hand out cpu first, then ver
-            if calls["cpu"] == 0:
-                calls["cpu"] += 1
-                return cpu
-            return ver
+    def test_self_corrects_until_grounded(self):
+        client = _Client(["Chapter 1187 releases July 5 2026 (https://a/x).",   # synth (fabricated)
+                          _claims(("July 5 2026", False)),                       # verify: flag date
+                          "Chapter 1187 is out; sources give no date (https://a/x).",  # correction
+                          _claims(("1187", True))])                              # verify: grounded
         slept = []
         ans = webanswer.answer_web("latest chapter?", out=lambda s: None,
-                                   route=lambda s: _route(s, gpu_up=False),
-                                   factory=factory, search=self._search, fetch=self._fetch,
-                                   sleep=slept.append)
-        self.assertEqual(slept, [])                        # no cooldown, no GPU correction
-        self.assertNotIn("1187", ans)
-        self.assertIn("VIZ", ans)
+                                   route=lambda s: _route(s, gpu=True), factory=self._factory(client),
+                                   search=lambda q, limit=6: "WEB RESULTS:\n- a (https://a/x)",
+                                   fetch=lambda u: "chapter 1187", sleep=slept.append,
+                                   warmup=lambda c: True)
+        self.assertEqual(len(client.calls), 4)              # synth, verify, correct, verify
+        self.assertEqual(len(slept), 3)                     # cooldown before each GPU prefill after #1
+        self.assertNotIn("July 5", ans)
+
+    def test_budget_exhaustion_keeps_best_effort(self):
+        client = _Client(["a1 (https://a/x)", _claims(("x", False)),
+                          "a2 (https://a/x)", _claims(("x", False))])
+        slept = []
+        ans = webanswer.answer_web("q", out=lambda s: None,
+                                   route=lambda s: _route(s, gpu=True), factory=self._factory(client),
+                                   search=lambda q, limit=6: "WEB RESULTS:\n- a (https://a/x)",
+                                   fetch=lambda u: "text", max_iters=2, sleep=slept.append,
+                                   warmup=lambda c: True)
+        self.assertEqual(len(client.calls), 4)              # synth, verify, correct, verify → stop
+        self.assertTrue(ans)                                # returns best-effort, not blank
+
+    def test_cpu_path_skips_warmup_and_cooldown(self):
+        client = _Client(["a1", _claims(("x", False)), "a2", _claims(("x", True))])
+        slept, warmed = [], []
+        webanswer.answer_web("q", out=lambda s: None,
+                             route=lambda s: _route(s, gpu=False),          # synth on CPU (8086)
+                             factory=self._factory(client),
+                             search=lambda q, limit=6: "WEB RESULTS:\n- a (https://a/x)",
+                             fetch=lambda u: "text", sleep=slept.append,
+                             warmup=lambda c: warmed.append(1) or True)
+        self.assertEqual(warmed, [])                         # CPU → no warm-up
+        self.assertEqual(slept, [])                          # CPU → no cooldown
 
     def test_never_raises_when_everything_fails(self):
         class Boom:
             def chat(self, *a, **k): raise RuntimeError("down")
-        def bad_search(q, limit=6): raise RuntimeError("x")
-        out = []
-        ans = webanswer.answer_web("q", out=out.append,
-                                   route=lambda s: _route(s, gpu_up=True),
+        ans = webanswer.answer_web("q", out=lambda s: None,
+                                   route=lambda s: _route(s, gpu=True),
                                    factory=lambda *a, **k: Boom(),
-                                   search=bad_search, fetch=lambda u: (_ for _ in ()).throw(RuntimeError()))
-        self.assertIsInstance(ans, str)                    # produced something, did not raise
+                                   search=lambda q, limit=6: (_ for _ in ()).throw(RuntimeError()),
+                                   fetch=lambda u: (_ for _ in ()).throw(RuntimeError()),
+                                   warmup=lambda c: False)
+        self.assertIsInstance(ans, str)
 
 
 if __name__ == "__main__":
