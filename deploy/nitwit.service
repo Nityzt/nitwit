@@ -1,0 +1,14 @@
+[Unit]
+Description=Nitwit autonomous mission daemon
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/nit/qwen-orchestrator
+Environment=NITWIT_PORT=8807
+ExecStart=/usr/bin/env python3 -m nitwit
+Restart=on-failure
+Nice=10
+
+[Install]
+WantedBy=default.target
