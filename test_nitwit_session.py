@@ -57,5 +57,19 @@ class TestEnsureDaemon(unittest.TestCase):
         self.assertFalse(result)
 
 
+class TestStreamAnswer(unittest.TestCase):
+    def test_streams_chunks(self):
+        from nitwit import session
+        class FakeClient:
+            def __init__(self, *a, **k): pass
+            def stream_chat(self, messages, *, temperature, max_tokens, response_format=None):
+                for c in ["Hello", " world"]:
+                    yield c
+        chunks = []
+        session.stream_answer("hi", None, coder_url="http://x", coder_model="m",
+                              out=chunks.append, _client_factory=lambda u, m: FakeClient())
+        self.assertEqual("".join(chunks), "Hello world\n")
+
+
 if __name__ == "__main__":
     unittest.main()

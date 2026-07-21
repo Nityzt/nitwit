@@ -80,6 +80,20 @@ class TestCli(unittest.TestCase):
         out = buf.getvalue()
         self.assertIn("--repo", out)
 
+    def test_bare_interactive_routes_to_session(self):
+        # main() with no subcommand and stdin closed should attempt the interactive session,
+        # which reads EOF immediately and exits cleanly (no traceback).
+        import sys
+        old = sys.stdin
+        sys.stdin = io.StringIO("")  # immediate EOF
+        try:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                cli.main(["--url", self.base])  # ensure_daemon sees the stub (status 200)
+            self.assertIn("nitwit", buf.getvalue().lower())  # printed a banner
+        finally:
+            sys.stdin = old
+
 
 if __name__ == "__main__":
     unittest.main()

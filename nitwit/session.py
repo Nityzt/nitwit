@@ -78,3 +78,31 @@ def ensure_daemon(url: str, *, spawn: bool = True, timeout: float = 20.0) -> boo
             return True
         time.sleep(0.4)
     return False
+
+
+def _default_chunk(s):
+    import sys
+    sys.stdout.write(s); sys.stdout.flush()
+
+
+def stream_answer(text, repo, *, coder_url, coder_model, out=_default_chunk, _client_factory=None):
+    from orchestrator import OpenAICompatibleClient
+    factory = _client_factory or (lambda u, m: OpenAICompatibleClient(u, m))
+    files = ""
+    if repo:
+        try:
+            files = ", ".join(sorted(os.listdir(repo))[:40])
+        except Exception:
+            files = ""
+    system = ("You are a concise coding assistant working inside a local repository."
+              + (f" Repo root: {repo}. Top-level entries: {files}." if repo else "")
+              + " Answer the user's question directly and briefly.")
+    try:
+        client = factory(coder_url, coder_model)
+        for chunk in client.stream_chat(
+                [{"role": "system", "content": system}, {"role": "user", "content": text}],
+                temperature=0.2, max_tokens=800):
+            out(chunk)
+        out("\n")
+    except Exception as exc:
+        out(f"\n(couldn't reach the model: {exc})\n")

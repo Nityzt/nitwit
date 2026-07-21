@@ -6,6 +6,7 @@ import http.client
 import json
 import os
 import urllib.request
+from nitwit import session
 
 DEFAULT_URL = os.environ.get("NITWIT_URL", "http://127.0.0.1:8807")
 
@@ -33,6 +34,25 @@ def humanize_event(event: dict) -> str:
     if kind == "mission_finished":  return f"[{mid}] finished: {event.get('state')}"
     if kind == "mission_error":     return f"[{mid}] ERROR: {event.get('error')}"
     return f"[{mid}] {kind}"
+
+
+def stream_events_for(base, mission_id, out=print):
+    try:
+        with urllib.request.urlopen(base + "/events") as r:
+            for raw in r:
+                line = raw.decode().strip()
+                if not line.startswith("data: "):
+                    continue
+                ev = json.loads(line[6:])
+                if ev.get("mission_id") != mission_id:
+                    continue
+                out(humanize_event(ev))
+                if ev.get("event") in ("mission_finished", "mission_error"):
+                    return
+    except KeyboardInterrupt:
+        out("(detached — mission keeps running; `/missions` to check, `wit diff <id>` to review)")
+    except Exception as exc:
+        out(f"(stream ended: {exc})")
 
 
 def cmd_status(args, base):
@@ -106,28 +126,66 @@ def cmd_tail(args, base):
     stream(base)
 
 
-def repl(base):
-    print("wit — interactive. /help for commands, /quit to exit. Missions keep running in the daemon.")
+def _start_mission(base, repo, test_cmd, goal):
+    if not repo:
+        print("this looks like a task, but you're not in a git repo. cd into one and try again.")
+        return
+    crit = []
+    if test_cmd:
+        crit.append({"type": "tests", "repo": repo, "cmd": test_cmd})
+    crit.append({"type": "verifier", "description": "the request is meaningfully and correctly done"})
+    branch = "agent/" + __import__("nitwit.missions", fromlist=["slugify"]).slugify(goal)[:40]
+    _, m = api_call(base, "POST", "/missions",
+                    {"goal": goal, "repos": [{"path": repo, "branch": branch, "test_cmd": test_cmd or "",
+                                              "checkpoint_commit": ""}], "success_criteria": crit})
+    if not (isinstance(m, dict) and m.get("id")):
+        print(m); return
+    api_call(base, "POST", "/control/on")
+    print(f"→ mission {m['id']} on {branch} (Ctrl-C to detach; it keeps running)")
+    stream_events_for(base, m["id"])
+    _, fin = api_call(base, "GET", f"/missions/{m['id']}")
+    if isinstance(fin, dict):
+        print(f"mission {m['id']}: {fin.get('state')} · review: wit diff {m['id']} (or git -C {repo} diff main..{branch})")
+
+
+def interactive(base, cwd, coder_url, coder_model):
+    if not session.ensure_daemon(base):
+        print("could not start the nitwit daemon; check ~/.local/share/nitwit/daemon.log")
+        return
+    repo = session.repo_root(cwd)
+    test_cmd = session.detect_test_cmd(repo) if repo else None
+    where = repo or f"{cwd} (not a git repo — tasks need a repo)"
+    print(f"nitwit · {where} · tests: {test_cmd or 'none detected'} · /help, /quit")
     while True:
         try:
-            line = input("wit> ").strip()
+            line = input("wit ▸ ").strip()
         except (EOFError, KeyboardInterrupt):
-            print(); break
+            print(); return
         if not line:
             continue
         if line in ("/quit", "/exit"):
-            break
+            return
         if line == "/help":
-            print("/ls /status /tail /new <goal> --repo P --test CMD /pause <id> /resume <id> "
-                  "/cancel <id> /answer <id> <text> /on /off /quit")
+            print("Talk naturally: a question is answered here; a task ('add ...', 'fix ...') "
+                  "runs as a mission on a branch (Ctrl-C detaches).\n"
+                  "/missions  /diff <id>  /status  /on  /off  /mission <goal>  /quit")
             continue
-        argv = line[1:].split() if line.startswith("/") else ["new"] + [line]
-        if not argv:
-            continue
-        try:
-            main(argv + ["--url", base])
-        except SystemExit:
-            pass
+        if line.startswith("/"):
+            parts = line[1:].split()
+            cmd = parts[0] if parts else ""
+            if cmd == "missions": cmd_ls(argparse.Namespace(), base); continue
+            if cmd == "status":   cmd_status(argparse.Namespace(), base); continue
+            if cmd in ("on", "off"): cmd_toggle(cmd == "on")(argparse.Namespace(), base); continue
+            if cmd == "diff" and len(parts) > 1:
+                _, m = api_call(base, "GET", f"/missions/{parts[1]}")
+                print(json.dumps(m, indent=2) if isinstance(m, dict) else m); continue
+            if cmd == "mission" and len(parts) > 1:
+                _start_mission(base, repo, test_cmd, " ".join(parts[1:])); continue
+            print("unknown command; /help"); continue
+        if session.classify_intent(line) == "task":
+            _start_mission(base, repo, test_cmd, line)
+        else:
+            session.stream_answer(line, repo, coder_url=coder_url, coder_model=coder_model)
 
 
 def build_parser():
@@ -165,7 +223,9 @@ def main(argv=None):
         args.goal, args.repo, args.test, args.branch = args.prompt, None, None, "mission"
         return cmd_new(args, base)
     if not args.cmd:
-        return repl(base)
+        return interactive(base, os.getcwd(),
+                           os.environ.get("NITWIT_CODER_URL", "http://127.0.0.1:8080"),
+                           os.environ.get("NITWIT_CODER_MODEL", "qwen2.5-coder-7b"))
     dispatch[args.cmd](args, base)
 
 
