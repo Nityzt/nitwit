@@ -141,16 +141,23 @@ _HEDGE = ("real-time", "real time", "realtime", "knowledge cutoff", "as of my la
 
 
 def _strip_lead_disclaimer(text: str) -> str:
-    """Drop a leading hedge sentence (e.g. 'I can't perform real-time web searches, but …') when
-    real content follows. Only touches the FIRST sentence and only if it carries a hedge phrase."""
+    """Drop a leading hedge (e.g. 'I can't perform real-time web searches, but …') when real content
+    follows. Handles both the hedge-as-its-own-sentence form and the inline 'hedge, but <answer>'
+    form. Only strips when the lead carries a known hedge phrase, so ordinary answers pass through."""
     s = text.lstrip()
+    # (1) leading-sentence strip: a first sentence that is itself the hedge, keeping the rest.
     m = re.search(r"[.!?:]\s", s)
-    if not m:
-        return text
-    first, rest = s[: m.end()], s[m.end():]
-    if rest.strip() and any(h in first.lower() for h in _HEDGE):
-        rest = re.sub(r"^(but|however|instead)[,:]?\s+", "", rest.lstrip(), flags=re.IGNORECASE)
-        return rest.lstrip()
+    if m:
+        first, rest = s[: m.end()], s[m.end():]
+        if rest.strip() and any(h in first.lower() for h in _HEDGE):
+            rest = re.sub(r"^(but|however|instead)[,:]?\s+", "", rest.lstrip(), flags=re.IGNORECASE)
+            return rest.lstrip()
+    # (2) inline connector strip: 'HEDGE …, but <answer>' within a single sentence.
+    m2 = re.search(r",\s+(?:but|however|instead)\b[,:]?\s+", s, flags=re.IGNORECASE)
+    if m2 and any(h in s[: m2.start()].lower() for h in _HEDGE):
+        rest = s[m2.end():].strip()
+        if rest:
+            return rest
     return text
 
 
@@ -238,17 +245,22 @@ def _build_system(repo, files, memories, *, can_search):
 
 
 def stream_answer(text, repo, *, history=None, out=_default_chunk, _client_factory=None,
-                  _endpoint=None, _route=None, allow_search=True, _search_fn=None, memories=None):
-    """Stream a chat answer on the router-selected CHAT model. The model can request a web search
-    (SEARCH: <query>); obvious current-info questions search proactively. Whenever results are
-    present the system prompt switches to a *grounded* mode so the model answers from them instead
-    of re-emitting SEARCH:. Recalls `memories`. Never raises; returns the answer text."""
+                  _endpoint=None, _route=None, allow_search=True, _search_fn=None, memories=None,
+                  _answer_web=None):
+    """Stream a chat answer on the router-selected CHAT model. Ordinary chat streams live from the
+    CPU 4B. When the turn needs the web — an obvious current-info question, or the model itself
+    emitting `SEARCH: <query>` — it delegates to the grounded webanswer pipeline (fetch pages →
+    GPU-7B synthesize → CPU-4B verify → correct/hedge), trading latency for accuracy. Recalls
+    `memories`. Never raises; returns the answer text."""
     from orchestrator import OpenAICompatibleClient
     from nitwit.router import route as _default_route
     from nitwit import tools
     router = _route or _default_route
     ep = _endpoint or router("chat")
     factory = _client_factory or (lambda u, m, extra_body=None: OpenAICompatibleClient(u, m, extra_body=extra_body))
+    if _answer_web is None:
+        from nitwit import webanswer
+        _answer_web = webanswer.answer_web
     files = ""
     if repo:
         try:
@@ -256,55 +268,26 @@ def stream_answer(text, repo, *, history=None, out=_default_chunk, _client_facto
         except Exception:
             files = ""
 
-    def do_search(query):
-        out("[searching the web…]\n")
-        try:
-            return (_search_fn or tools.web_search)(query)
-        except Exception:
-            return "WEB RESULTS:\n(no results)"
+    def run_web(query):
+        return _answer_web(query, out=out, route=router, factory=factory, search=_search_fn)
 
-    # A proactive search on obvious current-info questions means results are present up front, so
-    # start in grounded mode (no SEARCH: instruction) and disable further searching this turn.
+    # Proactive: an obvious current-info question goes straight to the grounded pipeline.
     proactive = allow_search and tools.needs_web_search(text)
     can_search = allow_search and not proactive
     messages = [{"role": "system", "content": _build_system(repo, files, memories, can_search=can_search)}]
     messages.extend(history or [])
-    proactive_results = None
-    if proactive:
-        proactive_results = do_search(text)
-        messages.append({"role": "system",
-                         "content": "WEB RESULTS (use these for current facts, cite URLs):\n" + proactive_results})
-        allow_search = False
-
     messages.append({"role": "user", "content": text})
-
-    def grounded_answer(client, msgs, fallback):
-        # Buffer a grounded reply, drop any leading cutoff/real-time disclaimer, then emit once.
-        tmp: list = []
-        _stream_and_peek(client, msgs, lambda s: None, tmp, allow_search=False)
-        answer = _strip_lead_disclaimer("".join(tmp)).strip()
-        if not answer:                                # model gave nothing usable → show raw results
-            answer = fallback
-        if answer:
-            out(answer)
-        return answer
 
     parts = []
     try:
-        client = factory(ep.base_url, ep.model, extra_body=ep.extra_body)
-        if proactive:                                 # results already present → grounded, buffered
-            parts.append(grounded_answer(client, messages, proactive_results or ""))
+        if proactive:
+            parts.append(run_web(text))
         else:
+            client = factory(ep.base_url, ep.model, extra_body=ep.extra_body)
             query = _stream_and_peek(client, messages, out, parts, allow_search)
             if query is not None:                     # the model asked to search
-                results = do_search(query or text)    # empty model query → fall back to the question
-                # switch system[0] to grounded so the re-ask answers from results, not another SEARCH:
-                messages[0] = {"role": "system",
-                               "content": _build_system(repo, files, memories, can_search=False)}
-                messages.append({"role": "system", "content": "WEB RESULTS (use these, cite URLs):\n" + results})
                 parts.clear()                         # discard the SEARCH: directive text
-                client2 = factory(ep.base_url, ep.model, extra_body=ep.extra_body)
-                parts.append(grounded_answer(client2, messages, results))
+                parts.append(run_web(query or text))  # empty model query → fall back to the question
         out("\n")
     except Exception as exc:
         out(f"\n(couldn't reach the model: {exc})\n")
