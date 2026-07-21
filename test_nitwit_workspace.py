@@ -2,7 +2,7 @@ import os
 import subprocess
 import tempfile
 import unittest
-from nitwit.workspace import Workspace, FileEdit, DirtyRepo, git
+from nitwit.workspace import Workspace, FileEdit, DirtyRepo, UnsafeEditPath, git
 
 
 def make_repo() -> str:
@@ -49,6 +49,24 @@ class TestWorkspaceGit(unittest.TestCase):
         self.assertTrue(sha)
         # committing again with no change returns ""
         self.assertEqual(self.ws.commit("noop"), "")
+
+    def test_apply_edits_rejects_relative_escape(self):
+        self.ws.ensure_branch("agent/test")
+        with self.assertRaises(UnsafeEditPath):
+            self.ws.apply_edits([FileEdit("../evil.txt", "x")])
+
+    def test_apply_edits_rejects_absolute_escape(self):
+        self.ws.ensure_branch("agent/test")
+        with self.assertRaises(UnsafeEditPath):
+            self.ws.apply_edits([FileEdit("/tmp/evil_abs.txt", "x")])
+
+    def test_apply_edits_allows_legitimate_nested_path(self):
+        self.ws.ensure_branch("agent/test")
+        self.ws.apply_edits([FileEdit("src/deep/app.py", "print('nested')\n")])
+        nested = os.path.join(self.repo, "src/deep/app.py")
+        self.assertTrue(os.path.exists(nested))
+        with open(nested) as fh:
+            self.assertEqual(fh.read(), "print('nested')\n")
 
 
 if __name__ == "__main__":

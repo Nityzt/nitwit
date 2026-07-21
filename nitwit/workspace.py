@@ -10,6 +10,10 @@ class DirtyRepo(Exception):
     pass
 
 
+class UnsafeEditPath(Exception):
+    pass
+
+
 @dataclass
 class FileEdit:
     path: str      # repo-relative
@@ -43,9 +47,12 @@ class Workspace:
             git(self.repo_path, "checkout", "-q", "-b", branch)
 
     def apply_edits(self, edits: list[FileEdit]) -> None:
+        repo_root = os.path.realpath(self.repo_path)
         for edit in edits:
-            full = os.path.join(self.repo_path, edit.path)
-            os.makedirs(os.path.dirname(full) or self.repo_path, exist_ok=True)
+            full = os.path.realpath(os.path.join(self.repo_path, edit.path))
+            if full != repo_root and not full.startswith(repo_root + os.sep):
+                raise UnsafeEditPath(f"edit path escapes repo: {edit.path!r}")
+            os.makedirs(os.path.dirname(full), exist_ok=True)
             with open(full, "w") as fh:
                 fh.write(edit.content)
 
