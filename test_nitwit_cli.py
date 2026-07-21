@@ -18,6 +18,7 @@ class _Stub(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/status": return self._send({"on": True, "active_mission": None, "counts": {"done": 2}})
         if self.path == "/missions": return self._send([{"id": "m1", "goal": "g", "state": "done", "iteration": 1}])
+        if self.path.startswith("/missions/"): return self._send({"id": "m1", "repos": []})
         self._send({"error": "nf"})
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0); self.rfile.read(n)
@@ -81,21 +82,52 @@ class TestCli(unittest.TestCase):
         out = buf.getvalue()
         self.assertIn("--repo", out)
 
-    def test_start_mission_without_repo_is_graceful_refusal(self):
-        # _start_mission(base, repo=None, ...) must print a friendly refusal and
-        # must NOT raise or call the API (no repo to run a mission against).
+    def test_start_mission_without_repo_creates_scratch_workspace(self):
+        # _start_mission(base, repo=None, ...) should create a scratch workspace
+        # and proceed with the mission (not refuse).
         calls = []
         orig_api_call = cli.api_call
         def spy(base, method, path, body=None):
             calls.append((method, path))
+            if method == "GET" and "/missions/" in path:
+                return (200, {"id": "m1", "state": "done"})
             return orig_api_call(base, method, path, body)
         buf = io.StringIO()
         with redirect_stdout(buf):
             with unittest.mock.patch.object(cli, "api_call", side_effect=spy):
                 cli._start_mission(self.base, None, None, "add x")
         out = buf.getvalue().lower()
-        self.assertIn("git repo", out)
-        self.assertEqual(calls, [])
+        self.assertIn("scratch workspace", out)
+        self.assertIn("export", out)
+        # Should have called the API (POST /missions and GET /missions/{id})
+        self.assertGreater(len(calls), 0)
+        self.assertIn(("POST", "/missions"), calls)
+
+    def test_start_mission_with_repo_uses_branch_not_scratch(self):
+        # _start_mission(base, repo="/repo", ...) should use the repo and NOT create a scratch workspace.
+        import tempfile
+        repo = tempfile.mkdtemp()
+        calls = []
+        orig_api_call = cli.api_call
+        def spy(base, method, path, body=None):
+            calls.append((method, path, body))
+            if method == "GET" and "/missions/" in path:
+                return (200, {"id": "m1", "state": "done"})
+            return orig_api_call(base, method, path, body)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            with unittest.mock.patch.object(cli, "api_call", side_effect=spy):
+                cli._start_mission(self.base, repo, None, "add x")
+        out = buf.getvalue().lower()
+        # Should NOT mention scratch workspace
+        self.assertNotIn("scratch", out)
+        # Should mention the branch
+        self.assertIn("agent/add-x", out)
+        # Should have used the provided repo in the API call
+        post_missions = [call for call in calls if call[0] == "POST" and "/missions" in call[1]]
+        self.assertGreater(len(post_missions), 0)
+        body = post_missions[0][2]
+        self.assertIn(repo, body["repos"][0]["path"])
 
     def test_bare_interactive_routes_to_session(self):
         # main() with no subcommand and stdin closed should attempt the interactive session,
@@ -110,6 +142,23 @@ class TestCli(unittest.TestCase):
             self.assertIn("nitwit", buf.getvalue().lower())  # printed a banner
         finally:
             sys.stdin = old
+
+    def test_cmd_export(self):
+        import tempfile, os
+        # the stub returns a mission dict; ensure it has repos[0].path pointing at a real dir
+        src = tempfile.mkdtemp()
+        with open(os.path.join(src, "f.txt"), "w") as fh: fh.write("hi")
+        # monkeypatch api_call to return a mission with that path
+        orig = cli.api_call
+        cli.api_call = lambda base, method, path, body=None: (200, {"id": "m1", "repos": [{"path": src}]})
+        try:
+            dest = os.path.join(tempfile.mkdtemp(), "exported")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                cli.main(["export", "m1", dest, "--url", self.base])
+            self.assertTrue(os.path.exists(os.path.join(dest, "f.txt")))
+        finally:
+            cli.api_call = orig
 
 
 if __name__ == "__main__":

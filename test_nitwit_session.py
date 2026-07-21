@@ -117,6 +117,34 @@ class TestStreamAnswerIdentityAndRouting(unittest.TestCase):
         self.assertEqual(captured["u"], "http://chat:1")
 
 
+class TestScratchWorkspace(unittest.TestCase):
+    def test_creates_git_repo(self):
+        import tempfile, subprocess
+        from nitwit import session
+        root = tempfile.mkdtemp()
+        ws = session.scratch_workspace("build a cli tool", root=root)
+        self.assertTrue(ws.startswith(root))
+        self.assertTrue(os.path.isdir(os.path.join(ws, ".git")))
+        # HEAD exists (initial commit present) so ensure_branch/commit will work
+        r = subprocess.run(["git", "-C", ws, "rev-parse", "HEAD"], capture_output=True)
+        self.assertEqual(r.returncode, 0)
+
+    def test_export_copies_without_git(self):
+        import tempfile
+        from nitwit import session
+        src = tempfile.mkdtemp()
+        os.makedirs(os.path.join(src, ".git"))
+        with open(os.path.join(src, ".git", "config"), "w") as fh: fh.write("x")
+        with open(os.path.join(src, "app.py"), "w") as fh: fh.write("print(1)")
+        os.makedirs(os.path.join(src, "sub"))
+        with open(os.path.join(src, "sub", "b.txt"), "w") as fh: fh.write("b")
+        dest = os.path.join(tempfile.mkdtemp(), "out")
+        session.export_workspace(src, dest)
+        self.assertTrue(os.path.exists(os.path.join(dest, "app.py")))
+        self.assertTrue(os.path.exists(os.path.join(dest, "sub", "b.txt")))
+        self.assertFalse(os.path.exists(os.path.join(dest, ".git")))  # .git excluded
+
+
 if __name__ == "__main__":
     unittest.main()
 

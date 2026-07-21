@@ -85,6 +85,39 @@ def _default_chunk(s):
     sys.stdout.write(s); sys.stdout.flush()
 
 
+def scratch_workspace(goal, *, root=None):
+    """Creates an isolated scratch workspace for a mission.
+    Returns the absolute path to a new git repo with an initial commit."""
+    from nitwit.missions import slugify
+    import uuid
+    root = root or os.path.expanduser("~/.local/share/nitwit/workspaces")
+    os.makedirs(root, exist_ok=True)
+    path = os.path.join(root, f"{slugify(goal)[:32]}-{uuid.uuid4().hex[:8]}")
+    os.makedirs(path, exist_ok=True)
+    subprocess.run(["git", "-C", path, "init", "-q"], check=False)
+    subprocess.run(["git", "-C", path, "config", "user.email", "nitwit@localhost"], check=False)
+    subprocess.run(["git", "-C", path, "config", "user.name", "nitwit"], check=False)
+    subprocess.run(["git", "-C", path, "commit", "-q", "--allow-empty", "-m", "nitwit workspace"], check=False)
+    return path
+
+
+def export_workspace(src, dest):
+    """Copies every entry of src except .git into dest (creating dest).
+    Returns dest. Does not touch src."""
+    import shutil
+    os.makedirs(dest, exist_ok=True)
+    for name in os.listdir(src):
+        if name == ".git":
+            continue
+        s = os.path.join(src, name)
+        d = os.path.join(dest, name)
+        if os.path.isdir(s):
+            shutil.copytree(s, d, dirs_exist_ok=True)
+        else:
+            shutil.copy2(s, d)
+    return dest
+
+
 def stream_answer(text, repo, *, history=None, out=_default_chunk, _client_factory=None, _endpoint=None, _route=None):
     """Stream a chat answer on the best-fit CHAT model (router-selected: fast CPU 4B), carrying
     the conversation `history`. Returns the answer text. Never raises."""

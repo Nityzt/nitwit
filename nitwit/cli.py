@@ -126,10 +126,22 @@ def cmd_tail(args, base):
     stream(base)
 
 
+def cmd_export(args, base):
+    _, m = api_call(base, "GET", f"/missions/{args.id}")
+    if not (isinstance(m, dict) and m.get("repos")):
+        print(m if isinstance(m, dict) else f"no such mission {args.id}"); return
+    src = m["repos"][0]["path"]
+    dest = args.dest or os.path.join(os.getcwd(), f"nitwit-{args.id}")
+    session.export_workspace(src, dest)
+    print(f"exported {args.id} -> {dest}")
+
+
 def _start_mission(base, repo, test_cmd, goal):
+    scratch = False
     if not repo:
-        print("this looks like a task, but you're not in a git repo. cd into one and try again.")
-        return
+        repo = session.scratch_workspace(goal)
+        test_cmd = None
+        scratch = True
     crit = []
     if test_cmd:
         crit.append({"type": "tests", "repo": repo, "cmd": test_cmd})
@@ -141,11 +153,16 @@ def _start_mission(base, repo, test_cmd, goal):
     if not (isinstance(m, dict) and m.get("id")):
         print(m); return
     api_call(base, "POST", "/control/on")
-    print(f"→ mission {m['id']} on {branch} (Ctrl-C to detach; it keeps running)")
+    if scratch:
+        print(f"→ mission {m['id']} in a scratch workspace {repo}\n"
+              f"  (Ctrl-C to detach; `wit export {m['id']}` to copy the result out)")
+    else:
+        print(f"→ mission {m['id']} on {branch} (Ctrl-C to detach; it keeps running)")
     stream_events_for(base, m["id"])
     _, fin = api_call(base, "GET", f"/missions/{m['id']}")
     if isinstance(fin, dict):
-        print(f"mission {m['id']}: {fin.get('state')} · review: wit diff {m['id']} (or git -C {repo} diff main..{branch})")
+        tail = f"wit export {m['id']}" if scratch else f"wit diff {m['id']}"
+        print(f"mission {m['id']}: {fin.get('state')} · review: {tail}")
 
 
 # ANSI colors, disabled when not a TTY or when NO_COLOR is set (so pipes/tests stay clean).
@@ -202,6 +219,8 @@ def interactive(base, cwd):
                 print(json.dumps(m, indent=2) if isinstance(m, dict) else m); continue
             if cmd == "mission" and len(parts) > 1:
                 _start_mission(base, repo, test_cmd, " ".join(parts[1:])); continue
+            if cmd == "export" and len(parts) > 1:
+                cmd_export(argparse.Namespace(id=parts[1], dest=(parts[2] if len(parts) > 2 else None)), base); continue
             print(f"{C['dim']}unknown command; /help{C['reset']}"); continue
         if session.classify_intent(line) == "task":
             _start_mission(base, repo, test_cmd, line)
@@ -235,6 +254,8 @@ def build_parser():
     a = sub.add_parser("answer")
     a.add_argument("id"); a.add_argument("text", nargs="+")
     a.add_argument("--url", default=argparse.SUPPRESS)
+    e = sub.add_parser("export")
+    e.add_argument("id"); e.add_argument("dest", nargs="?"); e.add_argument("--url", default=argparse.SUPPRESS)
     return p
 
 
@@ -245,6 +266,7 @@ def main(argv=None):
         "status": cmd_status, "ls": cmd_ls, "new": cmd_new, "tail": cmd_tail,
         "pause": _simple("pause"), "resume": _simple("resume"), "cancel": _simple("cancel"),
         "answer": cmd_answer, "on": cmd_toggle(True), "off": cmd_toggle(False),
+        "export": cmd_export,
     }
     if args.prompt:
         args.goal, args.repo, args.test, args.branch = args.prompt, None, None, "mission"
