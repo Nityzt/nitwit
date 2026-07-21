@@ -118,11 +118,12 @@ def export_workspace(src, dest):
     return dest
 
 
-def stream_answer(text, repo, *, history=None, out=_default_chunk, _client_factory=None, _endpoint=None, _route=None):
+def stream_answer(text, repo, *, history=None, out=_default_chunk, _client_factory=None, _endpoint=None, _route=None, allow_search=True, _search_fn=None):
     """Stream a chat answer on the best-fit CHAT model (router-selected: fast CPU 4B), carrying
     the conversation `history`. Returns the answer text. Never raises."""
     from orchestrator import OpenAICompatibleClient
     from nitwit.router import route as _default_route
+    from nitwit import tools
     router = _route or _default_route
     ep = _endpoint or router("chat")
     factory = _client_factory or (lambda u, m, extra_body=None: OpenAICompatibleClient(u, m, extra_body=extra_body))
@@ -140,6 +141,12 @@ def stream_answer(text, repo, *, history=None, out=_default_chunk, _client_facto
                 "contradict earlier answers.")
     messages = [{"role": "system", "content": system}]
     messages.extend(history or [])
+    if allow_search and tools.needs_web_search(text):
+        out("[searching the web…]\n")
+        results = (_search_fn or tools.web_search)(text)
+        messages.append({"role": "system",
+                         "content": "Web search results for the user's question — use these for "
+                                    "current facts and cite the URLs:\n" + results})
     messages.append({"role": "user", "content": text})
     parts: list[str] = []
 

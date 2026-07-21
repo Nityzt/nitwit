@@ -166,3 +166,39 @@ class TestStreamAnswerHistory(unittest.TestCase):
                                     out=lambda s: None, _client_factory=lambda u, m, extra_body=None: FakeClient())
         self.assertEqual(seen["n"], 4)          # system + 2 history + current user
         self.assertEqual(ans, "ok")             # answer text returned (no trailing newline)
+
+
+class TestStreamAnswerSearch(unittest.TestCase):
+    def test_search_injected_when_needed(self):
+        from nitwit import session
+        from nitwit.router import Endpoint
+        captured = {}
+        class FakeClient:
+            def __init__(self, *a, **k): pass
+            def stream_chat(self, messages, *, temperature, max_tokens, response_format=None):
+                captured["messages"] = messages
+                yield {"type": "chunk", "content": "answer"}; yield {"type": "done"}
+        ep = Endpoint("http://x", "m", {})
+        session.stream_answer("what is the latest next.js version?", None, _endpoint=ep,
+                              out=lambda s: None, _client_factory=lambda u, m, extra_body=None: FakeClient(),
+                              _search_fn=lambda q: "WEB RESULTS:\n- Next.js: v15 (https://nextjs.org)")
+        joined = "\n".join(m["content"] for m in captured["messages"])
+        self.assertIn("WEB RESULTS", joined)
+        self.assertIn("nextjs.org", joined)
+
+    def test_no_search_for_ordinary_chat(self):
+        from nitwit import session
+        from nitwit.router import Endpoint
+        captured = {}
+        class FakeClient:
+            def __init__(self, *a, **k): pass
+            def stream_chat(self, messages, *, temperature, max_tokens, response_format=None):
+                captured["messages"] = messages
+                yield {"type": "chunk", "content": "ok"}; yield {"type": "done"}
+        called = {"n": 0}
+        def search(q): called["n"] += 1; return "WEB RESULTS:\n(x)"
+        session.stream_answer("what does parse() do?", None, _endpoint=Endpoint("http://x", "m", {}),
+                              out=lambda s: None, _client_factory=lambda u, m, extra_body=None: FakeClient(),
+                              _search_fn=search)
+        self.assertEqual(called["n"], 0)  # heuristic False -> no search
+        self.assertNotIn("WEB RESULTS", "\n".join(m["content"] for m in captured["messages"]))
