@@ -56,6 +56,30 @@ class TestCli(unittest.TestCase):
             cli.main(["new", "new goal", "--url", self.base])
         self.assertIn("m2", buf.getvalue())
 
+    def test_url_before_subcommand_is_honored(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cli.main(["--url", self.base, "status"])
+        out = buf.getvalue()
+        self.assertIn("on", out.lower())
+        # active_mission only appears in the real stub /status payload, never in
+        # the "cannot reach daemon" fallback message -- this is what actually
+        # proves --url before the subcommand reached the stub server.
+        self.assertIn("active_mission", out)
+
+    def test_new_multiword_goal_without_quotes(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cli.main(["new", "fix", "the", "bug", "--url", self.base])
+        self.assertIn("m2", buf.getvalue())
+
+    def test_new_test_without_repo_is_friendly_error(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cli.main(["new", "goal", "--test", "pytest", "--url", self.base])
+        out = buf.getvalue()
+        self.assertIn("--repo", out)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
-import sys
 import urllib.request
 
 DEFAULT_URL = os.environ.get("NITWIT_URL", "http://127.0.0.1:8807")
@@ -49,16 +49,20 @@ def cmd_ls(args, base):
 
 
 def cmd_new(args, base):
+    goal = " ".join(args.goal) if isinstance(args.goal, list) else args.goal
+    if args.test and not args.repo:
+        print("--test requires --repo")
+        return
     repos = []
     if args.repo:
         repos = [{"path": os.path.abspath(args.repo), "branch": f"agent/{args.branch}",
                   "test_cmd": args.test or "", "checkpoint_commit": ""}]
     crit = []
-    if args.test:
+    if args.repo and args.test:
         crit.append({"type": "tests", "repo": os.path.abspath(args.repo), "cmd": args.test})
     crit.append({"type": "verifier", "description": "the goal is meaningfully complete"})
     _, m = api_call(base, "POST", "/missions",
-                    {"goal": args.goal, "repos": repos, "success_criteria": crit})
+                    {"goal": goal, "repos": repos, "success_criteria": crit})
     print(f"created {m.get('id')} ({m.get('state')})" if isinstance(m, dict) and m.get("id") else m)
 
 
@@ -70,7 +74,8 @@ def _simple(action):
 
 
 def cmd_answer(args, base):
-    _, m = api_call(base, "POST", f"/missions/{args.id}/answer", {"answer": args.text})
+    text = " ".join(args.text) if isinstance(args.text, list) else args.text
+    _, m = api_call(base, "POST", f"/missions/{args.id}/answer", {"answer": text})
     print(f"{args.id}: {m.get('state', m)}" if isinstance(m, dict) else m)
 
 
@@ -92,6 +97,8 @@ def stream(base, out=print):
     except KeyboardInterrupt:
         pass
     except urllib.error.URLError as e:
+        out(f"stream ended: {e}")
+    except (ConnectionError, http.client.IncompleteRead) as e:
         out(f"stream ended: {e}")
 
 
@@ -115,6 +122,8 @@ def repl(base):
                   "/cancel <id> /answer <id> <text> /on /off /quit")
             continue
         argv = line[1:].split() if line.startswith("/") else ["new"] + [line]
+        if not argv:
+            continue
         try:
             main(argv + ["--url", base])
         except SystemExit:
@@ -126,12 +135,21 @@ def build_parser():
     p.add_argument("-p", "--prompt", help="one-shot: create a mission from this goal and exit")
     p.add_argument("--url", default=DEFAULT_URL)
     sub = p.add_subparsers(dest="cmd")
+    # Each subparser's --url defaults to argparse.SUPPRESS: when the subcommand
+    # doesn't repeat --url, argparse's namespace merge leaves the parent's
+    # value alone instead of stomping it with a subparser default. When --url
+    # IS given after the subcommand, it still overrides normally.
     for name in ("status", "ls", "tail", "on", "off"):
-        s = sub.add_parser(name); s.add_argument("--url", default=DEFAULT_URL)
-    n = sub.add_parser("new"); n.add_argument("goal"); n.add_argument("--repo"); n.add_argument("--test"); n.add_argument("--branch", default="mission"); n.add_argument("--url", default=DEFAULT_URL)
+        s = sub.add_parser(name); s.add_argument("--url", default=argparse.SUPPRESS)
+    n = sub.add_parser("new")
+    n.add_argument("goal", nargs="+")
+    n.add_argument("--repo"); n.add_argument("--test"); n.add_argument("--branch", default="mission")
+    n.add_argument("--url", default=argparse.SUPPRESS)
     for name in ("pause", "resume", "cancel"):
-        s = sub.add_parser(name); s.add_argument("id"); s.add_argument("--url", default=DEFAULT_URL)
-    a = sub.add_parser("answer"); a.add_argument("id"); a.add_argument("text"); a.add_argument("--url", default=DEFAULT_URL)
+        s = sub.add_parser(name); s.add_argument("id"); s.add_argument("--url", default=argparse.SUPPRESS)
+    a = sub.add_parser("answer")
+    a.add_argument("id"); a.add_argument("text", nargs="+")
+    a.add_argument("--url", default=argparse.SUPPRESS)
     return p
 
 
