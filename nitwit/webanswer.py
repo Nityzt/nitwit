@@ -15,7 +15,9 @@ safe value on failure; `answer_web` NEVER raises.
 """
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 import time
 
 _MAX_CONTEXT = 6000
@@ -111,8 +113,8 @@ def clean(answer: str) -> str:
 
 
 def _warmup(client) -> bool:
-    """Wake a cold GPU with a tiny prefill before the first real synthesis (cold-start guard).
-    Returns True if the endpoint responded. Never raises."""
+    """Wake the GPU with a tiny prefill before the first real synthesis. Returns True if the
+    endpoint responded. Never raises."""
     try:
         client.chat([{"role": "user", "content": "Reply with: ok"}], temperature=0.0, max_tokens=2)
         return True
@@ -120,8 +122,24 @@ def _warmup(client) -> bool:
         return False
 
 
+def _gpu_undervolt_active(_probe=None) -> bool:
+    """The RX 580 needs CoreCtrl's undervolt applied before any 927 MHz GPU compute, or it faults
+    and drops off the PCIe bus (incident 2026-07-21). CoreCtrl applies the undervolt at login, so
+    pre-login / headless there is none — and the 24/7 daemon can run then. Gate GPU synthesis on
+    CoreCtrl being active; without it, synthesis falls back to the CPU model. Override with
+    NITWIT_GPU_UNPROTECTED_OK=1 when the undervolt is applied some other way. Never raises."""
+    if os.environ.get("NITWIT_GPU_UNPROTECTED_OK") == "1":
+        return True
+    probe = _probe or (lambda: subprocess.run(["pgrep", "-x", "corectrl"],
+                                              capture_output=True).returncode == 0)
+    try:
+        return bool(probe())
+    except Exception:
+        return False
+
+
 def answer_web(query, *, out, route, factory, search=None, fetch=None,
-               max_iters=3, cooldown=2.0, sleep=None, warmup=None):
+               max_iters=3, cooldown=2.0, sleep=None, warmup=None, gpu_ok=None):
     """Search, fetch pages, then synthesize and self-correct in a loop until the answer is grounded
     in CONTEXT or `max_iters` verification passes are spent. Streams a '[searching…]' note then the
     final answer to `out`; returns the answer text. NEVER raises.
@@ -131,6 +149,7 @@ def answer_web(query, *, out, route, factory, search=None, fetch=None,
     """
     sleep = sleep or time.sleep
     warmup = warmup or _warmup
+    gpu_ok = gpu_ok or _gpu_undervolt_active
     from nitwit import tools
     out("[searching the web…]\n")
     ctx = tools.gather_context(query, _search=search, _fetch=fetch)
@@ -138,9 +157,13 @@ def answer_web(query, *, out, route, factory, search=None, fetch=None,
 
     synth_ep = route("synth")
     on_gpu = "8080" in synth_ep.base_url
+    if on_gpu and not gpu_ok():
+        # No CoreCtrl undervolt applied → GPU compute would fault the card. Use the CPU model.
+        synth_ep = route("chat")
+        on_gpu = "8080" in synth_ep.base_url
     client = factory(synth_ep.base_url, synth_ep.model, extra_body=synth_ep.extra_body)
     if on_gpu:
-        warmup(client)                                   # cold-start guard
+        warmup(client)                                   # wake the GPU before the first real prefill
 
     # Synthesis AND verification run on the same model: the 7B is a markedly more reliable judge
     # than the 4B (bench: 87.5% vs 75%) and, on the GPU, fast enough to loop. A cooldown before
