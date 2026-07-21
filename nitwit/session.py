@@ -99,10 +99,15 @@ def stream_answer(text, repo, *, coder_url, coder_model, out=_default_chunk, _cl
               + " Answer the user's question directly and briefly.")
     try:
         client = factory(coder_url, coder_model)
-        for chunk in client.stream_chat(
+        for event in client.stream_chat(
                 [{"role": "system", "content": system}, {"role": "user", "content": text}],
                 temperature=0.2, max_tokens=800):
-            out(chunk)
+            if isinstance(event, dict):
+                if event.get("type") == "chunk":
+                    out(event.get("content", ""))
+                # ignore "done" and any other event types
+            elif isinstance(event, str):
+                out(event)  # tolerate a plain-string streamer too
         out("\n")
     except Exception as exc:
         out(f"\n(couldn't reach the model: {exc})\n")

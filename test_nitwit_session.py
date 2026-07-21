@@ -63,8 +63,9 @@ class TestStreamAnswer(unittest.TestCase):
         class FakeClient:
             def __init__(self, *a, **k): pass
             def stream_chat(self, messages, *, temperature, max_tokens, response_format=None):
-                for c in ["Hello", " world"]:
-                    yield c
+                yield {"type": "chunk", "content": "Hello"}
+                yield {"type": "chunk", "content": " world"}
+                yield {"type": "done"}
         chunks = []
         session.stream_answer("hi", None, coder_url="http://x", coder_model="m",
                               out=chunks.append, _client_factory=lambda u, m: FakeClient())

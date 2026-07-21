@@ -2,6 +2,7 @@ import io
 import json
 import threading
 import unittest
+import unittest.mock
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from contextlib import redirect_stdout
@@ -79,6 +80,22 @@ class TestCli(unittest.TestCase):
             cli.main(["new", "goal", "--test", "pytest", "--url", self.base])
         out = buf.getvalue()
         self.assertIn("--repo", out)
+
+    def test_start_mission_without_repo_is_graceful_refusal(self):
+        # _start_mission(base, repo=None, ...) must print a friendly refusal and
+        # must NOT raise or call the API (no repo to run a mission against).
+        calls = []
+        orig_api_call = cli.api_call
+        def spy(base, method, path, body=None):
+            calls.append((method, path))
+            return orig_api_call(base, method, path, body)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            with unittest.mock.patch.object(cli, "api_call", side_effect=spy):
+                cli._start_mission(self.base, None, None, "add x")
+        out = buf.getvalue().lower()
+        self.assertIn("git repo", out)
+        self.assertEqual(calls, [])
 
     def test_bare_interactive_routes_to_session(self):
         # main() with no subcommand and stdin closed should attempt the interactive session,

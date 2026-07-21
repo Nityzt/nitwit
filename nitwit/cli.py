@@ -223,9 +223,13 @@ def main(argv=None):
         args.goal, args.repo, args.test, args.branch = args.prompt, None, None, "mission"
         return cmd_new(args, base)
     if not args.cmd:
-        return interactive(base, os.getcwd(),
-                           os.environ.get("NITWIT_CODER_URL", "http://127.0.0.1:8080"),
-                           os.environ.get("NITWIT_CODER_MODEL", "qwen2.5-coder-7b"))
+        try:
+            return interactive(base, os.getcwd(),
+                               os.environ.get("NITWIT_CODER_URL", "http://127.0.0.1:8080"),
+                               os.environ.get("NITWIT_CODER_MODEL", "qwen2.5-coder-7b"))
+        except KeyboardInterrupt:
+            print()
+            return
     dispatch[args.cmd](args, base)
 
 
