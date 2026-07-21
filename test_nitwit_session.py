@@ -93,7 +93,9 @@ class TestStreamAnswerIdentityAndRouting(unittest.TestCase):
         self.assertEqual(seen["model"], "qwen3-4b")
         self.assertEqual(seen["extra"], {"chat_template_kwargs": {"enable_thinking": False}})
         self.assertIn("Nitwit", seen["system"])
-        self.assertNotIn("GPT-4", seen["system"])
+        # The new identity copy explicitly denies being GPT-4 ("...you are not GPT-4.") so the
+        # substring "GPT-4" is present by design; assert the denial rather than plain absence.
+        self.assertIn("not GPT-4", seen["system"])
         self.assertIn("not created by OpenAI", seen["system"].replace("Anthropic", "").replace("or ", "") + " not created by OpenAI")  # identity asserts it isn't OpenAI's
         self.assertEqual(ans, "ok")
 
@@ -202,3 +204,148 @@ class TestStreamAnswerSearch(unittest.TestCase):
                               _search_fn=search)
         self.assertEqual(called["n"], 0)  # heuristic False -> no search
         self.assertNotIn("WEB RESULTS", "\n".join(m["content"] for m in captured["messages"]))
+
+
+class TestStreamAnswerModelDecidedSearch(unittest.TestCase):
+    def test_search_directive_triggers_one_bounded_search_then_final_answer(self):
+        from nitwit import session
+        from nitwit.router import Endpoint
+
+        calls = {"n": 0}
+        captured = {"messages_2": None}
+
+        class FakeClient1:
+            def __init__(self, *a, **k): pass
+            def stream_chat(self, messages, *, temperature, max_tokens, response_format=None):
+                yield {"type": "chunk", "content": "SEARCH: latest next.js\n"}
+                yield {"type": "done"}
+
+        class FakeClient2:
+            def __init__(self, *a, **k): pass
+            def stream_chat(self, messages, *, temperature, max_tokens, response_format=None):
+                captured["messages_2"] = messages
+                yield {"type": "chunk", "content": "It's v15"}
+                yield {"type": "done"}
+
+        def factory(u, m, extra_body=None):
+            calls["n"] += 1
+            return FakeClient1() if calls["n"] == 1 else FakeClient2()
+
+        searched = {}
+        def search_fn(q):
+            searched["q"] = q
+            return "WEB RESULTS:\n- x (u)"
+
+        ep = Endpoint("http://x", "m", {})
+        # "tell me more" doesn't match any proactive heuristic phrase, so the model gets the
+        # first turn with allow_search=True and can itself emit the SEARCH: directive.
+        ans = session.stream_answer("tell me more", None, _endpoint=ep, out=lambda s: None,
+                                    _client_factory=factory, _search_fn=search_fn)
+        self.assertEqual(calls["n"], 2)                       # exactly one re-ask, no loop
+        self.assertEqual(searched["q"], "latest next.js")
+        self.assertEqual(ans, "It's v15")                     # SEARCH: text discarded, only final answer
+        joined = "\n".join(m["content"] for m in captured["messages_2"])
+        self.assertIn("WEB RESULTS", joined)
+
+
+class TestStreamAnswerDirectNoSearch(unittest.TestCase):
+    def test_plain_reply_not_mistaken_for_search_directive(self):
+        from nitwit import session
+        from nitwit.router import Endpoint
+
+        class FakeClient:
+            def __init__(self, *a, **k): pass
+            def stream_chat(self, messages, *, temperature, max_tokens, response_format=None):
+                yield {"type": "chunk", "content": "Hello world"}
+                yield {"type": "done"}
+
+        called = {"n": 0}
+        def search_fn(q):
+            called["n"] += 1
+            return "WEB RESULTS:\n(x)"
+
+        ep = Endpoint("http://x", "m", {})
+        ans = session.stream_answer("hi there", None, _endpoint=ep, out=lambda s: None,
+                                    _client_factory=lambda u, m, extra_body=None: FakeClient(),
+                                    _search_fn=search_fn)
+        self.assertEqual(ans, "Hello world")
+        self.assertEqual(called["n"], 0)
+
+
+class TestStreamAnswerProactiveFastPath(unittest.TestCase):
+    def test_proactive_search_disables_further_search_and_streams_plain_reply(self):
+        from nitwit import session
+        from nitwit.router import Endpoint
+
+        captured = {}
+
+        class FakeClient:
+            def __init__(self, *a, **k): pass
+            def stream_chat(self, messages, *, temperature, max_tokens, response_format=None):
+                captured["messages"] = messages
+                yield {"type": "chunk", "content": "Next.js 15 is latest, per web results."}
+                yield {"type": "done"}
+
+        called = {"n": 0}
+        def search_fn(q):
+            called["n"] += 1
+            called["q"] = q
+            return "WEB RESULTS:\n- Next.js: v15 (https://nextjs.org)"
+
+        ep = Endpoint("http://x", "m", {})
+        ans = session.stream_answer("what's the latest next.js version?", None, _endpoint=ep,
+                                    out=lambda s: None,
+                                    _client_factory=lambda u, m, extra_body=None: FakeClient(),
+                                    _search_fn=search_fn)
+        self.assertEqual(called["n"], 1)
+        self.assertEqual(called["q"], "what's the latest next.js version?")
+        joined = "\n".join(m["content"] for m in captured["messages"])
+        self.assertIn("WEB RESULTS", joined)
+        self.assertEqual(ans, "Next.js 15 is latest, per web results.")
+
+
+class TestStreamAnswerMemories(unittest.TestCase):
+    def test_memories_injected_into_system_message(self):
+        from nitwit import session
+        from nitwit.router import Endpoint
+
+        seen = {}
+
+        class FakeClient:
+            def __init__(self, *a, **k): pass
+            def stream_chat(self, messages, *, temperature, max_tokens, response_format=None):
+                seen["system"] = messages[0]["content"]
+                yield {"type": "chunk", "content": "ok"}
+                yield {"type": "done"}
+
+        ep = Endpoint("http://x", "m", {})
+        session.stream_answer("hi", None, _endpoint=ep, out=lambda s: None,
+                              _client_factory=lambda u, m, extra_body=None: FakeClient(),
+                              memories=["uses pnpm", "call me Wit"])
+        self.assertIn("uses pnpm", seen["system"])
+        self.assertIn("call me Wit", seen["system"])
+
+
+class TestStreamAnswerIdentityCopy(unittest.TestCase):
+    def test_identity_prompt_allows_search_and_never_claims_no_internet(self):
+        from nitwit import session
+        from nitwit.router import Endpoint
+
+        seen = {}
+
+        class FakeClient:
+            def __init__(self, *a, **k): pass
+            def stream_chat(self, messages, *, temperature, max_tokens, response_format=None):
+                seen["system"] = messages[0]["content"]
+                yield {"type": "chunk", "content": "ok"}
+                yield {"type": "done"}
+
+        ep = Endpoint("http://x", "m", {})
+        session.stream_answer("hi", None, _endpoint=ep, out=lambda s: None,
+                              _client_factory=lambda u, m, extra_body=None: FakeClient())
+        system = seen["system"]
+        self.assertIn("Nitwit", system)
+        self.assertIn("SEARCH:", system)                 # tells the model how to ask for a search
+        self.assertNotIn("no internet", system.lower())  # never claims it lacks internet access
+        self.assertIn("not GPT-4", system)                # explicit denial (see report: contains
+                                                            # the substring "GPT-4" by design)

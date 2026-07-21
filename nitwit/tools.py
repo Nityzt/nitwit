@@ -8,7 +8,10 @@ import re
 # NOT trigger a search. Multi-word phrases carry the real "current/external info" intent.
 _CURRENT_SIGNALS = ("latest", "newest", "most recent", "release date", "released", "price",
                     "news", "weather", "who is the current", "how much", "when is the next",
-                    "when does", "stock price", "up to date", "up-to-date", "as of 20")
+                    "when does", "stock price", "up to date", "up-to-date", "as of 20",
+                    "search the web", "look it up", "look up", "google", "search for",
+                    "find out", "more details about", "any update", "what's happening",
+                    "look into", "whats the latest")
 
 
 def needs_web_search(text: str) -> bool:
