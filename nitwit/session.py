@@ -25,13 +25,13 @@ def repo_root(cwd: str) -> str | None:
 
 def detect_test_cmd(repo: str) -> str | None:
     def has(name): return os.path.exists(os.path.join(repo, name))
-    if has("pyproject.toml") or has("setup.py") or has("pytest.ini") or glob.glob(os.path.join(repo, "test_*.py")) \
-            or glob.glob(os.path.join(repo, "**", "test_*.py"), recursive=False):
+    if has("pyproject.toml") or has("setup.py") or has("pytest.ini") or glob.glob(os.path.join(repo, "test_*.py")):
         return "pytest"
     pkg = os.path.join(repo, "package.json")
     if os.path.exists(pkg):
         try:
-            data = json.load(open(pkg))
+            with open(pkg) as fh:
+                data = json.load(fh)
             if isinstance(data.get("scripts"), dict) and "test" in data["scripts"]:
                 return "npm test"
         except Exception:
@@ -63,9 +63,15 @@ def ensure_daemon(url: str, *, spawn: bool = True, timeout: float = 20.0) -> boo
     if not spawn:
         return False
     logdir = os.path.expanduser("~/.local/share/nitwit")
-    os.makedirs(logdir, exist_ok=True)
-    log = open(os.path.join(logdir, "daemon.log"), "a")
-    subprocess.Popen(["python3", "-m", "nitwit"], stdout=log, stderr=log, start_new_session=True)
+    try:
+        os.makedirs(logdir, exist_ok=True)
+        log = open(os.path.join(logdir, "daemon.log"), "a")
+        try:
+            subprocess.Popen(["python3", "-m", "nitwit"], stdout=log, stderr=log, start_new_session=True)
+        finally:
+            log.close()
+    except Exception:
+        return False
     end = time.time() + timeout
     while time.time() < end:
         if up():

@@ -1,5 +1,6 @@
 import os, tempfile, subprocess, unittest
-from nitwit.session import repo_root, detect_test_cmd, classify_intent
+from unittest.mock import patch
+from nitwit.session import repo_root, detect_test_cmd, classify_intent, ensure_daemon
 
 
 def _git(d, *a): subprocess.run(["git", "-C", d, *a], capture_output=True)
@@ -43,6 +44,17 @@ class TestClassify(unittest.TestCase):
         for a in ["what does parse() do?", "how does the loop work",
                   "explain this function", "is this thread-safe?"]:
             self.assertEqual(classify_intent(a), "answer", a)
+
+
+class TestEnsureDaemon(unittest.TestCase):
+    def test_spawn_failure_returns_false_and_does_not_raise(self):
+        with patch("nitwit.session.subprocess.Popen", side_effect=OSError("boom")):
+            result = ensure_daemon("http://127.0.0.1:9", spawn=True, timeout=0.2)
+        self.assertFalse(result)
+
+    def test_no_spawn_unreachable_returns_false_and_does_not_raise(self):
+        result = ensure_daemon("http://127.0.0.1:9", spawn=False, timeout=0.2)
+        self.assertFalse(result)
 
 
 if __name__ == "__main__":
