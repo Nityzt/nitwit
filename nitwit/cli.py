@@ -130,7 +130,9 @@ def cmd_export(args, base):
     _, m = api_call(base, "GET", f"/missions/{args.id}")
     if not (isinstance(m, dict) and m.get("repos")):
         print(m if isinstance(m, dict) else f"no such mission {args.id}"); return
-    src = m["repos"][0]["path"]
+    src = m["repos"][0].get("path")
+    if not src:
+        print(f"mission {args.id} has no workspace path to export"); return
     dest = args.dest or os.path.join(os.getcwd(), f"nitwit-{args.id}")
     session.export_workspace(src, dest)
     print(f"exported {args.id} -> {dest}")
@@ -161,7 +163,8 @@ def _start_mission(base, repo, test_cmd, goal):
     stream_events_for(base, m["id"])
     _, fin = api_call(base, "GET", f"/missions/{m['id']}")
     if isinstance(fin, dict):
-        tail = f"wit export {m['id']}" if scratch else f"wit diff {m['id']}"
+        tail = (f"wit export {m['id']}" if scratch
+                else f"wit diff {m['id']} (or git -C {repo} diff main..{branch})")
         print(f"mission {m['id']}: {fin.get('state')} · review: {tail}")
 
 
@@ -219,8 +222,11 @@ def interactive(base, cwd):
                 print(json.dumps(m, indent=2) if isinstance(m, dict) else m); continue
             if cmd == "mission" and len(parts) > 1:
                 _start_mission(base, repo, test_cmd, " ".join(parts[1:])); continue
-            if cmd == "export" and len(parts) > 1:
-                cmd_export(argparse.Namespace(id=parts[1], dest=(parts[2] if len(parts) > 2 else None)), base); continue
+            if cmd == "export":
+                if len(parts) < 2:
+                    print(f"{C['dim']}usage: /export <id> [dest]{C['reset']}"); continue
+                cmd_export(argparse.Namespace(id=parts[1],
+                                              dest=(" ".join(parts[2:]) if len(parts) > 2 else None)), base); continue
             print(f"{C['dim']}unknown command; /help{C['reset']}"); continue
         if session.classify_intent(line) == "task":
             _start_mission(base, repo, test_cmd, line)
