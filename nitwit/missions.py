@@ -53,7 +53,7 @@ class Mission:
 
 
 VALID_TRANSITIONS: dict[str, set[str]] = {
-    "queued": {"running", "cancelled"},
+    "queued": {"running", "cancelled", "paused"},
     "running": {"paused", "needs_input", "done", "failed", "queued"},  # ->queued = reconcile rewind
     "paused": {"running", "cancelled"},
     "needs_input": {"running", "cancelled"},

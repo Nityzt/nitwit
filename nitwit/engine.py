@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 
 from nitwit.coder import Coder, CoderResponse, MissionContext, Verifier
@@ -21,6 +22,7 @@ class MissionEngine:
         self.workspace_factory = workspace_factory
         self.max_iterations = max_iterations
         self.cooldown_s = cooldown_s
+        self._paused = threading.Event()
 
     def _snapshot(self, repo_path: str) -> dict[str, str]:
         files: dict[str, str] = {}
@@ -80,3 +82,42 @@ class MissionEngine:
         done, summary = self.evaluate_criteria(mission, workspaces)
         mission = self.store.append_note(mission.id, f"criteria -> {summary}")
         return mission, done
+
+    def pause(self) -> None:
+        self._paused.set()
+
+    def resume(self) -> None:
+        self._paused.clear()
+
+    def reconcile(self) -> int:
+        rewound = 0
+        for m in self.store.list(state="running"):
+            self.store.set_state(m.id, "queued")
+            rewound += 1
+        return rewound
+
+    def _prepare_workspaces(self, mission: Mission) -> dict[str, Workspace]:
+        workspaces = {}
+        for repo in mission.repos:
+            ws = self.workspace_factory(repo["path"])
+            ws.ensure_branch(repo["branch"])
+            workspaces[repo["path"]] = ws
+        return workspaces
+
+    def run_mission(self, mission_id: str) -> Mission:
+        mission = self.store.get(mission_id)
+        if self._paused.is_set():
+            return self.store.set_state(mission.id, "paused") if mission.state != "paused" else mission
+        mission = self.store.set_state(mission.id, "running")
+        workspaces = self._prepare_workspaces(mission)
+        while True:
+            if self._paused.is_set():
+                return self.store.set_state(mission.id, "paused")
+            mission, done = self.run_iteration(mission, workspaces)
+            if done:
+                return self.store.set_state(mission.id, "done")
+            if mission.iteration >= self.max_iterations:
+                self.store.append_note(mission.id, "hit max_iterations; awaiting input")
+                return self.store.set_state(mission.id, "needs_input")
+            if self.cooldown_s:
+                time.sleep(self.cooldown_s)
