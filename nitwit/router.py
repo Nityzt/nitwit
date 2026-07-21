@@ -2,6 +2,7 @@
 CPU/GPU. Health-checked with fallback to the GPU coder so a down CPU service never breaks chat."""
 from __future__ import annotations
 
+import copy
 import os
 import urllib.request
 from dataclasses import dataclass, field
@@ -25,8 +26,8 @@ def _build_defaults() -> dict[str, Endpoint]:
     ver_url, ver_model = _env("NITWIT_VERIFY_URL", "http://127.0.0.1:8086", "NITWIT_VERIFY_MODEL", "qwen3-4b")
     nothink = {"chat_template_kwargs": {"enable_thinking": False}}
     return {
-        "chat": Endpoint(chat_url, chat_model, dict(nothink)),
-        "utility": Endpoint(util_url, util_model, dict(nothink)),
+        "chat": Endpoint(chat_url, chat_model, copy.deepcopy(nothink)),
+        "utility": Endpoint(util_url, util_model, copy.deepcopy(nothink)),
         "code": Endpoint(code_url, code_model, {}),
         "verify": Endpoint(ver_url, ver_model, {}),
     }
