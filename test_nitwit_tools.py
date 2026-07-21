@@ -11,7 +11,8 @@ class TestNeedsWebSearch(unittest.TestCase):
 
     def test_ordinary_chat_false(self):
         for t in ["what does parse() do?", "explain closures", "hi", "thanks",
-                  "refactor this function", "how does a hash map work"]:
+                  "refactor this function", "how does a hash map work",
+                  "what's the current branch?", "what version of python are we using", "fix this now"]:
             self.assertFalse(needs_web_search(t), t)
 
 

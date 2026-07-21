@@ -143,7 +143,10 @@ def stream_answer(text, repo, *, history=None, out=_default_chunk, _client_facto
     messages.extend(history or [])
     if allow_search and tools.needs_web_search(text):
         out("[searching the web…]\n")
-        results = (_search_fn or tools.web_search)(text)
+        try:
+            results = (_search_fn or tools.web_search)(text)
+        except Exception:
+            results = "WEB RESULTS:\n(no results)"  # a search failure must never break the chat
         messages.append({"role": "system",
                          "content": "Web search results for the user's question — use these for "
                                     "current facts and cite the URLs:\n" + results})

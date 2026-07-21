@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import re
 
-_CURRENT_SIGNALS = ("latest", "current", "today", "now", "recent", "release date", "released",
-                    "version", "price", "news", "weather", "who is the", "how much", "when is",
-                    "when does", "stock", "this year", "up to date")
+# Kept precise: bare high-frequency dev words (current, version, now, today) are OMITTED so
+# ordinary chat ("what's the current branch?", "what version of python", "fix this now") does
+# NOT trigger a search. Multi-word phrases carry the real "current/external info" intent.
+_CURRENT_SIGNALS = ("latest", "newest", "most recent", "release date", "released", "price",
+                    "news", "weather", "who is the current", "how much", "when is the next",
+                    "when does", "stock price", "up to date", "up-to-date", "as of 20")
 
 
 def needs_web_search(text: str) -> bool:
