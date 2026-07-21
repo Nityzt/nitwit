@@ -15,14 +15,20 @@ _MAX_SNAPSHOT_BYTES = 20000
 
 class MissionEngine:
     def __init__(self, store: MissionStore, coder: Coder, verifier: Verifier,
-                 workspace_factory=Workspace, max_iterations: int = 20, cooldown_s: float = 0.0) -> None:
+                 workspace_factory=Workspace, max_iterations: int = 20, cooldown_s: float = 0.0, on_event=None) -> None:
         self.store = store
         self.coder = coder
         self.verifier = verifier
         self.workspace_factory = workspace_factory
         self.max_iterations = max_iterations
         self.cooldown_s = cooldown_s
+        self.on_event = on_event
         self._paused = threading.Event()
+
+    def _emit(self, event_type: str, mission_id: str, **data) -> None:
+        if self.on_event:
+            self.on_event({"event": event_type, "mission_id": mission_id,
+                           "time": round(time.time(), 3), **data})
 
     def _snapshot(self, repo_path: str) -> dict[str, str]:
         files: dict[str, str] = {}
@@ -71,17 +77,20 @@ class MissionEngine:
         return all_passed, "; ".join(summaries)
 
     def run_iteration(self, mission: Mission, workspaces: dict[str, Workspace]) -> tuple[Mission, bool]:
+        self._emit("iteration_started", mission.id, iteration=mission.iteration + 1)
         ctx = self.build_context(mission, workspaces, "")
         response: CoderResponse = self.coder.propose(ctx)
         primary_path = mission.repos[0]["path"]
         ws = workspaces[primary_path]
         if response.edits:
             ws.apply_edits(response.edits)
+            self._emit("edits_applied", mission.id, paths=[e.path for e in response.edits])
             ws.commit(f"iteration {mission.iteration + 1}: {response.note or 'edits'}")
         mission = self.store.bump_iteration(mission.id)
         if response.note:
             mission = self.store.append_note(mission.id, response.note)
         done, summary = self.evaluate_criteria(mission, workspaces)
+        self._emit("criteria_evaluated", mission.id, passed=done, summary=summary)
         mission = self.store.append_note(mission.id, f"criteria -> {summary}")
         return mission, done
 
@@ -132,17 +141,27 @@ class MissionEngine:
     def run_mission(self, mission_id: str) -> Mission:
         mission = self.store.get(mission_id)
         if self._paused.is_set():
-            return self.store.set_state(mission.id, "paused") if mission.state != "paused" else mission
+            if mission.state != "paused":
+                mission = self.store.set_state(mission.id, "paused")
+                self._emit("mission_finished", mission.id, state="paused")
+            return mission
         mission = self.store.set_state(mission.id, "running")
+        self._emit("mission_started", mission.id)
         workspaces = self._prepare_workspaces(mission)
         while True:
             if self._paused.is_set():
-                return self.store.set_state(mission.id, "paused")
+                mission = self.store.set_state(mission.id, "paused")
+                self._emit("mission_finished", mission.id, state="paused")
+                return mission
             mission, done = self.run_iteration(mission, workspaces)
             if done:
-                return self.store.set_state(mission.id, "done")
+                mission = self.store.set_state(mission.id, "done")
+                self._emit("mission_finished", mission.id, state="done")
+                return mission
             if mission.iteration >= self.max_iterations:
                 self.store.append_note(mission.id, "hit max_iterations; awaiting input")
-                return self.store.set_state(mission.id, "needs_input")
+                mission = self.store.set_state(mission.id, "needs_input")
+                self._emit("mission_finished", mission.id, state="needs_input")
+                return mission
             if self.cooldown_s:
                 time.sleep(self.cooldown_s)

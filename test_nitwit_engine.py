@@ -192,5 +192,37 @@ class TestEngineLoop(unittest.TestCase):
         self.assertNotEqual(result.state, "done")
 
 
+class TestEngineEvents(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.store = MissionStore(os.path.join(self.tmp, "m.db"))
+        self.repo = make_repo()
+
+    def test_emits_lifecycle_events(self):
+        events = []
+        coder = FakeCoder([CoderResponse(edits=[FileEdit("target.txt", "ok\n")], note="x")])
+        m = self.store.create(
+            "e", repos=[{"path": self.repo, "branch": "agent/e", "test_cmd": "", "checkpoint_commit": ""}],
+            success_criteria=[{"type": "tests", "repo": self.repo, "cmd": "grep -q ok target.txt"}])
+        engine = MissionEngine(self.store, coder, FakeVerifier(True), on_event=events.append)
+        engine.run_mission(m.id)
+        kinds = [e["event"] for e in events]
+        self.assertIn("mission_started", kinds)
+        self.assertIn("iteration_started", kinds)
+        self.assertIn("criteria_evaluated", kinds)
+        self.assertIn("mission_finished", kinds)
+        finished = [e for e in events if e["event"] == "mission_finished"][0]
+        self.assertEqual(finished["state"], "done")
+        self.assertEqual(finished["mission_id"], m.id)
+
+    def test_no_callback_is_safe(self):
+        coder = FakeCoder([CoderResponse(edits=[FileEdit("target.txt", "ok\n")], note="x")])
+        m = self.store.create(
+            "e", repos=[{"path": self.repo, "branch": "agent/e2", "test_cmd": "", "checkpoint_commit": ""}],
+            success_criteria=[{"type": "tests", "repo": self.repo, "cmd": "grep -q ok target.txt"}])
+        engine = MissionEngine(self.store, coder, FakeVerifier(True))  # no on_event
+        self.assertEqual(engine.run_mission(m.id).state, "done")
+
+
 if __name__ == "__main__":
     unittest.main()
