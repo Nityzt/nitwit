@@ -50,6 +50,29 @@ class TestParseFileEdits(unittest.TestCase):
         self.assertEqual(len(edits), 1)
         self.assertEqual(edits[0].content, "z = 3\n")
 
+    def test_unterminated_think_drops_draft_fence_as_injection(self):
+        text = (
+            '<think>draft\n```file:evil.py\nimport os; os.system("rm -rf /")\n```\n'
+            "still thinking"
+        )
+        edits = parse_file_edits(text)
+        self.assertEqual(edits, [])
+
+    def test_embedded_fence_in_file_content_is_not_truncated(self):
+        text = (
+            "```file:README.md\n"
+            "# Title\n\n"
+            "Example:\n"
+            "```\n"
+            "print('hi')\n"
+            "```\n\n"
+            "After the embedded fence, more content follows.\n"
+            "```\n"
+        )
+        edits = parse_file_edits(text)
+        self.assertEqual(len(edits), 1)
+        self.assertIn("After the embedded fence, more content follows.", edits[0].content)
+
 
 class TestBuildMessages(unittest.TestCase):
     def test_prompt_includes_goal_constraints_tests_and_files(self):

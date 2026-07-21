@@ -8,7 +8,8 @@ import re
 from nitwit.coder import CoderResponse, MissionContext
 from nitwit.workspace import FileEdit
 
-_FILE_BLOCK = re.compile(r"```file:(?P<path>[^\n`]+)\n(?P<body>.*?)```", re.DOTALL)
+_FILE_OPENER = re.compile(r"```file:([^\n`]+)\n")
+_STANDALONE_FENCE = re.compile(r"(?m)^```[ \t]*$")
 
 CODER_SYSTEM = (
     "You are an autonomous software engineer working toward a goal in a code repository. "
@@ -22,11 +23,27 @@ CODER_SYSTEM = (
 
 
 def parse_file_edits(text: str) -> list[FileEdit]:
+    # Drop closed <think>...</think> blocks. If a <think> remains unterminated
+    # (e.g. the model was cut off by max_tokens mid-reasoning), everything from
+    # that point on is incomplete draft content, never final output — discard it
+    # rather than let a fence the model was merely drafting become an edit.
     text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.DOTALL)
+    if "<think>" in text:
+        text = text[: text.index("<think>")]
+
+    matches = list(_FILE_OPENER.finditer(text))
     edits: list[FileEdit] = []
-    for m in _FILE_BLOCK.finditer(text):
-        path = m.group("path").strip()
-        body = m.group("body")
+    for i, m in enumerate(matches):
+        path = m.group(1).strip()
+        start = m.end()
+        seg_end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        segment = text[start:seg_end]
+        # The body runs up to the LAST stand-alone closing fence in this segment
+        # (a line that is exactly ```), not the first ``` substring — otherwise
+        # a fence embedded in legitimate file content (READMEs, docstrings)
+        # would silently truncate the edit.
+        closes = list(_STANDALONE_FENCE.finditer(segment))
+        body = segment[: closes[-1].start()] if closes else segment
         if path:
             edits.append(FileEdit(path=path, content=body))
     return edits
