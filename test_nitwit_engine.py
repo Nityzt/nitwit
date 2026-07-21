@@ -2,7 +2,7 @@ import os
 import tempfile
 import unittest
 from nitwit.missions import MissionStore
-from nitwit.workspace import Workspace, FileEdit
+from nitwit.workspace import Workspace, FileEdit, DirtyRepo, git
 from nitwit.coder import CoderResponse, FakeCoder, FakeVerifier
 from nitwit.engine import MissionEngine
 from test_nitwit_workspace import make_repo
@@ -137,6 +137,49 @@ class TestEngineLoop(unittest.TestCase):
         with open(os.path.join(self.repo, "target.txt")) as fh:
             self.assertEqual(fh.read(), "ok\n")
         self.assertFalse(os.path.exists(os.path.join(self.repo, "crash_debris.txt")))
+
+    def test_resume_never_clobbers_user_work_on_a_different_branch(self):
+        # Build a mission + repo, run one full iteration so the agent branch + a
+        # checkpoint commit exist (mirrors test_resume_after_crash_resets_dirty_tree).
+        m = self._mission([{"type": "tests", "repo": self.repo, "cmd": "grep -q ok target.txt"}])
+        branch = "agent/loop"
+        original_branch = git(self.repo, "rev-parse", "--abbrev-ref", "HEAD")
+        ws = Workspace(self.repo)
+        ws.ensure_branch(branch)
+        first_coder = FakeCoder([CoderResponse(edits=[FileEdit("target.txt", "nope\n")], note="attempt 1")])
+        engine1 = MissionEngine(self.store, first_coder, FakeVerifier(True))
+        m, done = engine1.run_iteration(m, {self.repo: ws})
+        self.assertFalse(done)
+        self.assertEqual(m.iteration, 1)
+        self.assertTrue(ws.is_clean())  # checkpoint commit landed; tree is clean
+
+        # Mission "crashed" (never made it back out of running), but in the meantime the
+        # USER checked the repo back out to their own branch and did normal work there:
+        # an untracked scratch file, plus an uncommitted edit to a tracked file the
+        # mission never touched.
+        git(self.repo, "checkout", "-q", original_branch)
+        with open(os.path.join(self.repo, "user_scratch.txt"), "w") as fh:
+            fh.write("my own untracked work\n")
+        readme_path = os.path.join(self.repo, "README.md")
+        with open(readme_path, "a") as fh:
+            fh.write("user edit - do not delete\n")
+        with open(readme_path) as fh:
+            readme_before = fh.read()
+        self.store.set_state(m.id, "running")  # mission never made it back out of "running"
+
+        # A fresh engine, as if the process restarted after the crash.
+        second_coder = FakeCoder([CoderResponse(edits=[FileEdit("target.txt", "ok\n")], note="attempt 2")])
+        engine2 = MissionEngine(self.store, second_coder, FakeVerifier(True))
+        rewound = engine2.reconcile()
+        self.assertEqual(rewound, 1)
+
+        with self.assertRaises(DirtyRepo):
+            engine2.run_mission(m.id)
+
+        # The user's work must survive the refusal untouched.
+        self.assertTrue(os.path.exists(os.path.join(self.repo, "user_scratch.txt")))
+        with open(readme_path) as fh:
+            self.assertEqual(fh.read(), readme_before)
 
     def test_empty_success_criteria_never_vacuously_done(self):
         # Zero success_criteria must not be treated as trivially satisfied; the mission

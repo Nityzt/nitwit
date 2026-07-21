@@ -7,7 +7,7 @@ import time
 
 from nitwit.coder import Coder, CoderResponse, MissionContext, Verifier
 from nitwit.missions import Mission, MissionStore
-from nitwit.workspace import Workspace, git
+from nitwit.workspace import DirtyRepo, Workspace, git
 
 # Files bigger than this are skipped in the context snapshot (keep prompt bounded).
 _MAX_SNAPSHOT_BYTES = 20000
@@ -102,16 +102,28 @@ class MissionEngine:
         workspaces = {}
         for repo in mission.repos:
             ws = self.workspace_factory(repo["path"])
-            # A mission is RESUMING this repo iff its agent branch already exists. On a
-            # fresh start ensure_branch's DirtyRepo guard protects the user's own
-            # uncommitted work; that guard already required a fully clean tree before the
-            # branch could ever be created, so any dirt found on an existing agent branch
-            # is necessarily leftover from this mission's own crashed iteration, never the
-            # user's -- safe to discard.
+            # A mission is RESUMING this repo iff its agent branch already exists. But the
+            # branch existing does NOT prove the current dirty tree is this mission's own
+            # crashed iteration -- between the crash and this resume, the user may have
+            # checked the repo out to their own branch and done ordinary work there. The
+            # real safety property is whether the repo is CURRENTLY parked on the agent
+            # branch: only then is any dirt provably this mission's own debris, safe to
+            # blow away with reset_hard. On any other branch the tree may hold the user's
+            # work, so we refuse (via ws.is_clean()'s check) rather than silently carrying
+            # their untracked files/edits onto the agent branch and then destroying them.
             existing = git(repo["path"], "branch", "--list", repo["branch"])
             if existing:
-                git(repo["path"], "checkout", "-q", repo["branch"])
-                ws.reset_hard()
+                current = git(repo["path"], "rev-parse", "--abbrev-ref", "HEAD")
+                if current == repo["branch"]:
+                    ws.reset_hard()
+                else:
+                    if not ws.is_clean():
+                        raise DirtyRepo(
+                            f"{repo['path']} has uncommitted changes on '{current}'; "
+                            f"commit or stash before resuming this mission"
+                        )
+                    git(repo["path"], "checkout", "-q", repo["branch"])
+                    ws.reset_hard()  # safe: tree was verified clean before switching
             else:
                 ws.ensure_branch(repo["branch"])
             workspaces[repo["path"]] = ws
