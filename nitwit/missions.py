@@ -45,6 +45,10 @@ class Mission:
         for key in _JSON_FIELDS:
             value = data.get(key)
             data[key] = json.loads(value) if isinstance(value, str) else (value or [])
+        for key in ("created", "updated"):
+            value = data.get(key)
+            if value is not None:
+                data[key] = float(value)
         return cls(**{k: data[k] for k in cls.__dataclass_fields__ if k in data})
 
 
@@ -66,12 +70,20 @@ class InvalidTransition(Exception):
 class MissionStore:
     _COLS = list(Mission.__dataclass_fields__.keys())
 
+    @staticmethod
+    def _coltype(col: str) -> str:
+        if col == "iteration":
+            return "INTEGER"
+        if col in ("created", "updated"):
+            return "REAL"
+        return "TEXT"
+
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        cols = ", ".join(f"{c} TEXT" if c not in ("iteration",) else f"{c} INTEGER" for c in self._COLS)
-        # id is the primary key; created/updated stored as REAL via TEXT is fine (json round-trips floats)
+        cols = ", ".join(f"{c} {self._coltype(c)}" for c in self._COLS)
+        # id is the primary key; created/updated stored as REAL so timestamps round-trip as floats
         self._conn.execute(f"CREATE TABLE IF NOT EXISTS missions ({cols}, PRIMARY KEY (id))")
         self._conn.commit()
 
@@ -107,10 +119,14 @@ class MissionStore:
             cur = self._conn.execute("SELECT * FROM missions ORDER BY created")
         return [Mission.from_row(dict(r)) for r in cur.fetchall()]
 
-    def set_state(self, mission_id, new_state) -> Mission:
+    def _require(self, mission_id) -> Mission:
         m = self.get(mission_id)
         if m is None:
             raise InvalidTransition(f"no such mission {mission_id}")
+        return m
+
+    def set_state(self, mission_id, new_state) -> Mission:
+        m = self._require(mission_id)
         if new_state != m.state and new_state not in VALID_TRANSITIONS.get(m.state, set()):
             raise InvalidTransition(f"{m.state} -> {new_state} not allowed")
         m.state = new_state
@@ -118,13 +134,13 @@ class MissionStore:
         return m
 
     def bump_iteration(self, mission_id) -> Mission:
-        m = self.get(mission_id)
+        m = self._require(mission_id)
         m.iteration += 1
         self.save(m)
         return m
 
     def append_note(self, mission_id, text) -> Mission:
-        m = self.get(mission_id)
+        m = self._require(mission_id)
         stamp = time.strftime("%H:%M:%S")
         m.notes = (m.notes + f"\n[{stamp}] {text}").strip()
         self.save(m)

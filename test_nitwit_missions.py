@@ -81,6 +81,27 @@ class TestMissionStore(unittest.TestCase):
         self.assertIn("first", self.store.get(m.id).notes)
         self.assertIn("second", self.store.get(m.id).notes)
 
+    def test_timestamps_are_floats_not_strings_after_fetch_and_reopen(self):
+        m = self.store.create("t")
+        fetched = self.store.get(m.id)
+        self.assertIs(type(fetched.created), float)
+        self.assertIs(type(fetched.updated), float)
+
+        reopened = MissionStore(os.path.join(self.tmp, "missions.db"))
+        refetched = reopened.get(m.id)
+        self.assertIs(type(refetched.created), float)
+        self.assertIs(type(refetched.updated), float)
+        self.assertAlmostEqual(refetched.created, m.created)
+        self.assertAlmostEqual(refetched.updated, m.updated)
+
+    def test_bump_iteration_missing_id_raises(self):
+        with self.assertRaises(InvalidTransition):
+            self.store.bump_iteration("does-not-exist")
+
+    def test_append_note_missing_id_raises(self):
+        with self.assertRaises(InvalidTransition):
+            self.store.append_note("does-not-exist", "x")
+
 
 if __name__ == "__main__":
     unittest.main()
