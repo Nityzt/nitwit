@@ -89,7 +89,15 @@ class MissionDaemon:
             try:
                 self.engine.run_mission(mission.id)
             except Exception as exc:  # never let one mission kill the worker
+                # Route the error to a terminal state so the mission doesn't get stuck
+                # in `running` forever (the worker only dispatches `queued` missions, so a
+                # stuck-`running` mission would sit idle and never retry). Record why.
                 self.bus.publish({"event": "mission_error", "mission_id": mission.id,
                                   "error": str(exc), "time": round(time.time(), 3)})
+                try:
+                    self.store.append_note(mission.id, f"ERROR: {exc}")
+                    self.store.set_state(mission.id, "failed")
+                except Exception:
+                    pass  # store already in a terminal/odd state; nothing more to do
             finally:
                 self._active_id = None

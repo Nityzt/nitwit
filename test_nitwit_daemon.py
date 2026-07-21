@@ -68,3 +68,27 @@ class TestMissionDaemon(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDaemonErrorRouting(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.store = MissionStore(os.path.join(self.tmp, "m.db"))
+        self.repo = make_repo()
+        # make the repo dirty (untracked, non-ignored file) so ensure_branch raises DirtyRepo
+        with open(os.path.join(self.repo, "scratch.txt"), "w") as fh:
+            fh.write("uncommitted\n")
+
+    def test_failing_mission_routed_to_failed_not_stuck_running(self):
+        engine = MissionEngine(self.store, FakeCoder([]), FakeVerifier(True), max_iterations=2)
+        daemon = MissionDaemon(self.store, engine)
+        m = self.store.create(
+            "x", repos=[{"path": self.repo, "branch": "agent/x", "test_cmd": "", "checkpoint_commit": ""}],
+            success_criteria=[{"type": "tests", "repo": self.repo, "cmd": "true"}])
+        daemon.start(); daemon.turn_on()
+        try:
+            # it must reach a TERMINAL failed state, never sit stuck in running
+            self.assertTrue(_wait_until(lambda: self.store.get(m.id).state == "failed"))
+            self.assertIn("ERROR", self.store.get(m.id).notes)
+        finally:
+            daemon.stop()
