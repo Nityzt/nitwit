@@ -101,6 +101,53 @@ class TestEngineLoop(unittest.TestCase):
         self.assertEqual(n, 1)
         self.assertEqual(self.store.get(m.id).state, "queued")
 
+    def test_resume_after_crash_resets_dirty_tree(self):
+        # Build a mission + repo and run one full iteration so a checkpoint commit exists
+        # on the agent branch (the "intended" last-good state).
+        m = self._mission([{"type": "tests", "repo": self.repo, "cmd": "grep -q ok target.txt"}])
+        branch = "agent/loop"
+        ws = Workspace(self.repo)
+        ws.ensure_branch(branch)
+        first_coder = FakeCoder([CoderResponse(edits=[FileEdit("target.txt", "nope\n")], note="attempt 1")])
+        engine1 = MissionEngine(self.store, first_coder, FakeVerifier(True))
+        m, done = engine1.run_iteration(m, {self.repo: ws})
+        self.assertFalse(done)
+        self.assertEqual(m.iteration, 1)
+        self.assertTrue(ws.is_clean())  # checkpoint commit landed; tree is clean
+
+        # Simulate a crash mid-iteration-2: a tracked file is half-edited (uncommitted)
+        # and an untracked file was created by the partial edit application.
+        with open(os.path.join(self.repo, "target.txt"), "w") as fh:
+            fh.write("half-written garbage\n")
+        with open(os.path.join(self.repo, "crash_debris.txt"), "w") as fh:
+            fh.write("leftover\n")
+        self.assertFalse(ws.is_clean())
+        self.store.set_state(m.id, "running")  # mission never made it back out of "running"
+
+        # A fresh engine, as if the process restarted after the crash.
+        second_coder = FakeCoder([CoderResponse(edits=[FileEdit("target.txt", "ok\n")], note="attempt 2")])
+        engine2 = MissionEngine(self.store, second_coder, FakeVerifier(True))
+        rewound = engine2.reconcile()
+        self.assertEqual(rewound, 1)
+        self.assertEqual(self.store.get(m.id).state, "queued")
+
+        result = engine2.run_mission(m.id)
+
+        self.assertEqual(result.state, "done")
+        with open(os.path.join(self.repo, "target.txt")) as fh:
+            self.assertEqual(fh.read(), "ok\n")
+        self.assertFalse(os.path.exists(os.path.join(self.repo, "crash_debris.txt")))
+
+    def test_empty_success_criteria_never_vacuously_done(self):
+        # Zero success_criteria must not be treated as trivially satisfied; the mission
+        # should keep iterating (and hit the cap) rather than complete after one no-op pass.
+        coder = FakeCoder([])  # never proposes edits; nothing to check anyway
+        m = self._mission([])  # no success criteria at all
+        engine = MissionEngine(self.store, coder, FakeVerifier(True), max_iterations=3)
+        result = engine.run_mission(m.id)
+        self.assertEqual(result.state, "needs_input")
+        self.assertNotEqual(result.state, "done")
+
 
 if __name__ == "__main__":
     unittest.main()

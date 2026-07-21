@@ -68,6 +68,39 @@ class TestWorkspaceGit(unittest.TestCase):
         with open(nested) as fh:
             self.assertEqual(fh.read(), "print('nested')\n")
 
+    def test_apply_edits_rejects_symlink_escape(self):
+        # A symlink INSIDE the repo whose target resolves OUTSIDE it must be caught by
+        # the realpath check, even though the edit path itself never contains "..".
+        self.ws.ensure_branch("agent/test")
+        os.symlink(tempfile.gettempdir(), os.path.join(self.repo, "outlink"))
+        with self.assertRaises(UnsafeEditPath):
+            self.ws.apply_edits([FileEdit("outlink/evil.txt", "x")])
+
+
+class TestWorkspaceResetHard(unittest.TestCase):
+    def setUp(self):
+        self.repo = make_repo()
+        self.ws = Workspace(self.repo)
+
+    def test_reset_hard_discards_dirty_and_untracked(self):
+        self.ws.ensure_branch("agent/reset")
+        self.ws.apply_edits([FileEdit("README.md", "checkpoint\n")])
+        sha = self.ws.commit("checkpoint")
+        self.assertTrue(sha)
+        # simulate a crashed half-iteration: dirty tracked file + untracked file
+        with open(os.path.join(self.repo, "README.md"), "w") as fh:
+            fh.write("half-applied garbage\n")
+        with open(os.path.join(self.repo, "untracked.txt"), "w") as fh:
+            fh.write("crash debris\n")
+        self.assertFalse(self.ws.is_clean())
+
+        self.ws.reset_hard()
+
+        self.assertTrue(self.ws.is_clean())
+        self.assertFalse(os.path.exists(os.path.join(self.repo, "untracked.txt")))
+        with open(os.path.join(self.repo, "README.md")) as fh:
+            self.assertEqual(fh.read(), "checkpoint\n")
+
 
 class TestWorkspaceRunTests(unittest.TestCase):
     def setUp(self):

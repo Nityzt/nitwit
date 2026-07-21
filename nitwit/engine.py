@@ -7,7 +7,7 @@ import time
 
 from nitwit.coder import Coder, CoderResponse, MissionContext, Verifier
 from nitwit.missions import Mission, MissionStore
-from nitwit.workspace import Workspace
+from nitwit.workspace import Workspace, git
 
 # Files bigger than this are skipped in the context snapshot (keep prompt bounded).
 _MAX_SNAPSHOT_BYTES = 20000
@@ -49,6 +49,8 @@ class MissionEngine:
         )
 
     def evaluate_criteria(self, mission: Mission, workspaces: dict[str, Workspace]) -> tuple[bool, str]:
+        if not mission.success_criteria:
+            return False, "no success criteria defined"
         summaries = []
         all_passed = True
         ctx = self.build_context(mission, workspaces, "")
@@ -100,7 +102,18 @@ class MissionEngine:
         workspaces = {}
         for repo in mission.repos:
             ws = self.workspace_factory(repo["path"])
-            ws.ensure_branch(repo["branch"])
+            # A mission is RESUMING this repo iff its agent branch already exists. On a
+            # fresh start ensure_branch's DirtyRepo guard protects the user's own
+            # uncommitted work; that guard already required a fully clean tree before the
+            # branch could ever be created, so any dirt found on an existing agent branch
+            # is necessarily leftover from this mission's own crashed iteration, never the
+            # user's -- safe to discard.
+            existing = git(repo["path"], "branch", "--list", repo["branch"])
+            if existing:
+                git(repo["path"], "checkout", "-q", repo["branch"])
+                ws.reset_hard()
+            else:
+                ws.ensure_branch(repo["branch"])
             workspaces[repo["path"]] = ws
         return workspaces
 

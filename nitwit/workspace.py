@@ -52,6 +52,13 @@ class Workspace:
         else:
             git(self.repo_path, "checkout", "-q", "-b", branch)
 
+    def reset_hard(self) -> None:
+        """Discard all uncommitted changes (tracked + untracked). Only safe to call on a
+        branch whose dirt is known to be the mission's own crashed iteration, never on a
+        tree that might hold a user's own uncommitted work."""
+        git(self.repo_path, "reset", "--hard", "HEAD")
+        git(self.repo_path, "clean", "-fd")
+
     def apply_edits(self, edits: list[FileEdit]) -> None:
         repo_root = os.path.realpath(self.repo_path)
         for edit in edits:
