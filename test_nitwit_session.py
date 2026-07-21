@@ -74,3 +74,20 @@ class TestStreamAnswer(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestStreamAnswerHistory(unittest.TestCase):
+    def test_history_passed_through_and_answer_returned(self):
+        from nitwit import session
+        seen = {}
+        class FakeClient:
+            def __init__(self, *a, **k): pass
+            def stream_chat(self, messages, *, temperature, max_tokens, response_format=None):
+                seen["n"] = len(messages)  # system + history + this user turn
+                yield {"type": "chunk", "content": "ok"}
+                yield {"type": "done"}
+        hist = [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"}]
+        ans = session.stream_answer("q2", None, coder_url="x", coder_model="m", history=hist,
+                                    out=lambda s: None, _client_factory=lambda u, m: FakeClient())
+        self.assertEqual(seen["n"], 4)          # system + 2 history + current user
+        self.assertEqual(ans, "ok")             # answer text returned (no trailing newline)

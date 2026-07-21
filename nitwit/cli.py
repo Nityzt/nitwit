@@ -148,27 +148,48 @@ def _start_mission(base, repo, test_cmd, goal):
         print(f"mission {m['id']}: {fin.get('state')} · review: wit diff {m['id']} (or git -C {repo} diff main..{branch})")
 
 
+# ANSI colors, disabled when not a TTY or when NO_COLOR is set (so pipes/tests stay clean).
+def _colors():
+    import os, sys
+    if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+        return {k: "" for k in ("prompt", "assist", "dim", "bold", "reset")}
+    return {"prompt": "\033[1;96m", "assist": "\033[0m", "dim": "\033[2m",
+            "bold": "\033[1m", "reset": "\033[0m"}
+
+# Keep the last N conversation turns in context (bounded so the prompt stays small).
+_HISTORY_TURNS = 12
+
+
 def interactive(base, cwd, coder_url, coder_model):
+    C = _colors()
     if not session.ensure_daemon(base):
         print("could not start the nitwit daemon; check ~/.local/share/nitwit/daemon.log")
         return
     repo = session.repo_root(cwd)
     test_cmd = session.detect_test_cmd(repo) if repo else None
-    where = repo or f"{cwd} (not a git repo — tasks need a repo)"
-    print(f"nitwit · {where} · tests: {test_cmd or 'none detected'} · /help, /quit")
+    where = repo or f"{cwd} {C['dim']}(not a git repo — tasks need a repo){C['reset']}"
+    print(f"{C['bold']}nitwit{C['reset']} · {where} · tests: {test_cmd or 'none detected'}")
+    print(f"{C['dim']}talk naturally — questions are answered here, tasks run as missions on a "
+          f"branch. /help · /quit{C['reset']}")
+    history: list[dict] = []
     while True:
         try:
-            line = input("wit ▸ ").strip()
+            line = input(f"\n{C['prompt']}wit ▸ {C['reset']}").strip()
         except (EOFError, KeyboardInterrupt):
-            print(); return
+            print()
+            return
         if not line:
             continue
         if line in ("/quit", "/exit"):
             return
         if line == "/help":
-            print("Talk naturally: a question is answered here; a task ('add ...', 'fix ...') "
-                  "runs as a mission on a branch (Ctrl-C detaches).\n"
-                  "/missions  /diff <id>  /status  /on  /off  /mission <goal>  /quit")
+            print(f"{C['dim']}Talk naturally: a question is answered here; a task "
+                  f"('add ...', 'fix ...') runs as a mission on a branch (Ctrl-C detaches).\n"
+                  f"/missions  /diff <id>  /status  /on  /off  /mission <goal>  /clear  /quit{C['reset']}")
+            continue
+        if line == "/clear":
+            history.clear()
+            print(f"{C['dim']}(conversation cleared){C['reset']}")
             continue
         if line.startswith("/"):
             parts = line[1:].split()
@@ -181,11 +202,18 @@ def interactive(base, cwd, coder_url, coder_model):
                 print(json.dumps(m, indent=2) if isinstance(m, dict) else m); continue
             if cmd == "mission" and len(parts) > 1:
                 _start_mission(base, repo, test_cmd, " ".join(parts[1:])); continue
-            print("unknown command; /help"); continue
+            print(f"{C['dim']}unknown command; /help{C['reset']}"); continue
         if session.classify_intent(line) == "task":
             _start_mission(base, repo, test_cmd, line)
         else:
-            session.stream_answer(line, repo, coder_url=coder_url, coder_model=coder_model)
+            print(C["assist"], end="")
+            answer = session.stream_answer(line, repo, coder_url=coder_url,
+                                           coder_model=coder_model, history=history)
+            print(C["reset"], end="", flush=True)
+            # remember the exchange so follow-ups have context (bounded)
+            history.append({"role": "user", "content": line})
+            history.append({"role": "assistant", "content": answer})
+            del history[:-2 * _HISTORY_TURNS]
 
 
 def build_parser():

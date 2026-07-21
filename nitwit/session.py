@@ -85,7 +85,11 @@ def _default_chunk(s):
     sys.stdout.write(s); sys.stdout.flush()
 
 
-def stream_answer(text, repo, *, coder_url, coder_model, out=_default_chunk, _client_factory=None):
+def stream_answer(text, repo, *, coder_url, coder_model, history=None, out=_default_chunk,
+                  _client_factory=None):
+    """Stream a chat answer, carrying the running conversation `history` (a list of
+    {"role","content"} turns) so follow-ups have context. Returns the full answer text
+    (so the caller can append it to the history). Never raises."""
     from orchestrator import OpenAICompatibleClient
     factory = _client_factory or (lambda u, m: OpenAICompatibleClient(u, m))
     files = ""
@@ -94,20 +98,29 @@ def stream_answer(text, repo, *, coder_url, coder_model, out=_default_chunk, _cl
             files = ", ".join(sorted(os.listdir(repo))[:40])
         except Exception:
             files = ""
-    system = ("You are a concise coding assistant working inside a local repository."
-              + (f" Repo root: {repo}. Top-level entries: {files}." if repo else "")
-              + " Answer the user's question directly and briefly.")
+    system = ("You are Nitwit, a concise local coding assistant"
+              + (f" working in the repository at {repo} (top-level entries: {files})." if repo
+                 else " (the user is not currently in a git repository).")
+              + " Answer the user's question directly and briefly. Use the conversation so far "
+                "for context; do not contradict earlier answers. Do not speculate about who built you.")
+    messages = [{"role": "system", "content": system}]
+    messages.extend(history or [])
+    messages.append({"role": "user", "content": text})
+    parts: list[str] = []
+
+    def emit(s):
+        parts.append(s)
+        out(s)
+
     try:
         client = factory(coder_url, coder_model)
-        for event in client.stream_chat(
-                [{"role": "system", "content": system}, {"role": "user", "content": text}],
-                temperature=0.2, max_tokens=800):
+        for event in client.stream_chat(messages, temperature=0.2, max_tokens=800):
             if isinstance(event, dict):
                 if event.get("type") == "chunk":
-                    out(event.get("content", ""))
-                # ignore "done" and any other event types
+                    emit(event.get("content", ""))
             elif isinstance(event, str):
-                out(event)  # tolerate a plain-string streamer too
+                emit(event)
         out("\n")
     except Exception as exc:
         out(f"\n(couldn't reach the model: {exc})\n")
+    return "".join(parts)
