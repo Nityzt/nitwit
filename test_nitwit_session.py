@@ -171,22 +171,21 @@ class TestStreamAnswerHistory(unittest.TestCase):
 
 
 class TestStreamAnswerSearch(unittest.TestCase):
-    def test_search_injected_when_needed(self):
+    def test_current_info_question_delegates_to_webanswer(self):
         from nitwit import session
         from nitwit.router import Endpoint
-        captured = {}
-        class FakeClient:
-            def __init__(self, *a, **k): pass
-            def stream_chat(self, messages, *, temperature, max_tokens, response_format=None):
-                captured["messages"] = messages
-                yield {"type": "chunk", "content": "answer"}; yield {"type": "done"}
+        seen = {}
+        def fake_answer_web(query, *, out, route, factory, search=None, fetch=None, **k):
+            seen["query"] = query
+            out("[searching the web…]\n")
+            return "Next.js 15 (https://nextjs.org)"
         ep = Endpoint("http://x", "m", {})
-        session.stream_answer("what is the latest next.js version?", None, _endpoint=ep,
-                              out=lambda s: None, _client_factory=lambda u, m, extra_body=None: FakeClient(),
-                              _search_fn=lambda q: "WEB RESULTS:\n- Next.js: v15 (https://nextjs.org)")
-        joined = "\n".join(m["content"] for m in captured["messages"])
-        self.assertIn("WEB RESULTS", joined)
-        self.assertIn("nextjs.org", joined)
+        ans = session.stream_answer("what is the latest next.js version?", None, _endpoint=ep,
+                                    out=lambda s: None,
+                                    _client_factory=lambda u, m, extra_body=None: None,
+                                    _answer_web=fake_answer_web)
+        self.assertEqual(seen["query"], "what is the latest next.js version?")  # proactive → pipeline
+        self.assertEqual(ans, "Next.js 15 (https://nextjs.org)")
 
     def test_no_search_for_ordinary_chat(self):
         from nitwit import session
@@ -207,45 +206,50 @@ class TestStreamAnswerSearch(unittest.TestCase):
 
 
 class TestStreamAnswerModelDecidedSearch(unittest.TestCase):
-    def test_search_directive_triggers_one_bounded_search_then_final_answer(self):
+    def test_search_directive_delegates_to_webanswer_with_the_query(self):
         from nitwit import session
         from nitwit.router import Endpoint
 
-        calls = {"n": 0}
-        captured = {"messages_2": None}
-
-        class FakeClient1:
+        class FakeClient1:  # first (live) turn: the model itself asks to search
             def __init__(self, *a, **k): pass
             def stream_chat(self, messages, *, temperature, max_tokens, response_format=None):
                 yield {"type": "chunk", "content": "SEARCH: latest next.js\n"}
                 yield {"type": "done"}
 
-        class FakeClient2:
-            def __init__(self, *a, **k): pass
-            def stream_chat(self, messages, *, temperature, max_tokens, response_format=None):
-                captured["messages_2"] = messages
-                yield {"type": "chunk", "content": "It's v15"}
-                yield {"type": "done"}
-
-        def factory(u, m, extra_body=None):
-            calls["n"] += 1
-            return FakeClient1() if calls["n"] == 1 else FakeClient2()
-
-        searched = {}
-        def search_fn(q):
-            searched["q"] = q
-            return "WEB RESULTS:\n- x (u)"
+        seen = {}
+        def fake_answer_web(query, *, out, route, factory, search=None, fetch=None, **k):
+            seen["query"] = query
+            return "It's v15 (https://nextjs.org)"
 
         ep = Endpoint("http://x", "m", {})
-        # "tell me more" doesn't match any proactive heuristic phrase, so the model gets the
-        # first turn with allow_search=True and can itself emit the SEARCH: directive.
+        # "tell me more" doesn't match any proactive heuristic phrase, so the model gets the first
+        # turn with allow_search=True and can itself emit the SEARCH: directive.
         ans = session.stream_answer("tell me more", None, _endpoint=ep, out=lambda s: None,
-                                    _client_factory=factory, _search_fn=search_fn)
-        self.assertEqual(calls["n"], 2)                       # exactly one re-ask, no loop
-        self.assertEqual(searched["q"], "latest next.js")
-        self.assertEqual(ans, "It's v15")                     # SEARCH: text discarded, only final answer
-        joined = "\n".join(m["content"] for m in captured["messages_2"])
-        self.assertIn("WEB RESULTS", joined)
+                                    _client_factory=lambda u, m, extra_body=None: FakeClient1(),
+                                    _answer_web=fake_answer_web)
+        self.assertEqual(seen["query"], "latest next.js")     # captured query drives the pipeline
+        self.assertEqual(ans, "It's v15 (https://nextjs.org)")  # SEARCH: text discarded
+
+    def test_bare_search_directive_falls_back_to_user_text(self):
+        from nitwit import session
+        from nitwit.router import Endpoint
+
+        class FakeClient1:
+            def __init__(self, *a, **k): pass
+            def stream_chat(self, messages, *, temperature, max_tokens, response_format=None):
+                yield {"type": "chunk", "content": "SEARCH:\n"}       # empty query
+                yield {"type": "done"}
+
+        seen = {}
+        def fake_answer_web(query, *, out, route, factory, search=None, fetch=None, **k):
+            seen["query"] = query
+            return "answer"
+
+        ep = Endpoint("http://x", "m", {})
+        session.stream_answer("who won the match", None, _endpoint=ep, out=lambda s: None,
+                              _client_factory=lambda u, m, extra_body=None: FakeClient1(),
+                              _answer_web=fake_answer_web)
+        self.assertEqual(seen["query"], "who won the match")   # empty model query → user text
 
 
 class TestStreamAnswerDirectNoSearch(unittest.TestCase):
@@ -272,36 +276,46 @@ class TestStreamAnswerDirectNoSearch(unittest.TestCase):
         self.assertEqual(called["n"], 0)
 
 
-class TestStreamAnswerProactiveFastPath(unittest.TestCase):
-    def test_proactive_search_disables_further_search_and_streams_plain_reply(self):
-        from nitwit import session
-        from nitwit.router import Endpoint
+class TestStreamAndPeek(unittest.TestCase):
+    """Direct unit tests for the live first-turn stream helper (the SEARCH: detector)."""
 
-        captured = {}
-
-        class FakeClient:
-            def __init__(self, *a, **k): pass
+    def _client(self, chunks):
+        class C:
             def stream_chat(self, messages, *, temperature, max_tokens, response_format=None):
-                captured["messages"] = messages
-                yield {"type": "chunk", "content": "Next.js 15 is latest, per web results."}
+                for c in chunks:
+                    yield {"type": "chunk", "content": c}
                 yield {"type": "done"}
+        return C()
 
-        called = {"n": 0}
-        def search_fn(q):
-            called["n"] += 1
-            called["q"] = q
-            return "WEB RESULTS:\n- Next.js: v15 (https://nextjs.org)"
+    def test_returns_query_on_search_directive(self):
+        from nitwit.session import _stream_and_peek
+        parts, out = [], []
+        q = _stream_and_peek(self._client(["SEARCH: latest one piece\n"]), [], out.append, parts, True)
+        self.assertEqual(q, "latest one piece")
+        self.assertEqual(parts, [])                       # directive not emitted
 
-        ep = Endpoint("http://x", "m", {})
-        ans = session.stream_answer("what's the latest next.js version?", None, _endpoint=ep,
-                                    out=lambda s: None,
-                                    _client_factory=lambda u, m, extra_body=None: FakeClient(),
-                                    _search_fn=search_fn)
-        self.assertEqual(called["n"], 1)
-        self.assertEqual(called["q"], "what's the latest next.js version?")
-        joined = "\n".join(m["content"] for m in captured["messages"])
-        self.assertIn("WEB RESULTS", joined)
-        self.assertEqual(ans, "Next.js 15 is latest, per web results.")
+    def test_short_reply_not_swallowed(self):
+        from nitwit.session import _stream_and_peek
+        parts, out = [], []
+        q = _stream_and_peek(self._client(["ok"]), [], out.append, parts, True)
+        self.assertIsNone(q)
+        self.assertEqual("".join(parts), "ok")
+
+    def test_plain_reply_streams(self):
+        from nitwit.session import _stream_and_peek
+        parts = []
+        q = _stream_and_peek(self._client(["Hello ", "world"]), [], lambda s: None, parts, True)
+        self.assertIsNone(q)
+        self.assertEqual("".join(parts), "Hello world")
+
+    def test_parroted_directive_stripped_when_search_disabled(self):
+        from nitwit.session import _stream_and_peek
+        parts = []
+        q = _stream_and_peek(self._client(["SEARCH: x\nReal answer here."]), [], lambda s: None,
+                             parts, False)
+        self.assertIsNone(q)
+        self.assertNotIn("SEARCH:", "".join(parts))
+        self.assertIn("Real answer here.", "".join(parts))
 
 
 class TestStreamAnswerMemories(unittest.TestCase):
@@ -351,67 +365,6 @@ class TestStreamAnswerIdentityCopy(unittest.TestCase):
                                                             # the substring "GPT-4" by design)
 
 
-class TestStreamAnswerGroundedPrompt(unittest.TestCase):
-    """When results are already injected, the system prompt must NOT keep telling the model to
-    emit SEARCH: — a weak model parrots the directive instead of answering (real bug from Image #6)."""
-
-    def test_proactive_search_switches_to_grounded_prompt(self):
-        from nitwit import session
-        from nitwit.router import Endpoint
-
-        seen = {}
-
-        class FakeClient:
-            def __init__(self, *a, **k): pass
-            def stream_chat(self, messages, *, temperature, max_tokens, response_format=None):
-                seen["system"] = messages[0]["content"]
-                yield {"type": "chunk", "content": "Next.js 15, per the results."}
-                yield {"type": "done"}
-
-        ep = Endpoint("http://x", "m", {})
-        session.stream_answer("what's the latest next.js version?", None, _endpoint=ep,
-                              out=lambda s: None,
-                              _client_factory=lambda u, m, extra_body=None: FakeClient(),
-                              _search_fn=lambda q: "WEB RESULTS:\n- x (u)")
-        sys = seen["system"]
-        self.assertNotIn("reply with EXACTLY", sys)     # no can-search directive when grounded
-        self.assertIn("already been run", sys)          # grounded framing present
-        self.assertIn("Nitwit", sys)
-
-    def test_model_decided_search_rebuilds_grounded_for_reask(self):
-        from nitwit import session
-        from nitwit.router import Endpoint
-
-        calls = {"n": 0}
-        seen = {}
-
-        class C1:
-            def __init__(self, *a, **k): pass
-            def stream_chat(self, messages, *, temperature, max_tokens, response_format=None):
-                # first turn is allowed to search
-                assert "reply with EXACTLY" in messages[0]["content"]
-                yield {"type": "chunk", "content": "SEARCH: latest next.js\n"}
-                yield {"type": "done"}
-
-        class C2:
-            def __init__(self, *a, **k): pass
-            def stream_chat(self, messages, *, temperature, max_tokens, response_format=None):
-                seen["system"] = messages[0]["content"]
-                yield {"type": "chunk", "content": "It's v15"}
-                yield {"type": "done"}
-
-        def factory(u, m, extra_body=None):
-            calls["n"] += 1
-            return C1() if calls["n"] == 1 else C2()
-
-        ep = Endpoint("http://x", "m", {})
-        ans = session.stream_answer("tell me more", None, _endpoint=ep, out=lambda s: None,
-                                    _client_factory=factory, _search_fn=lambda q: "WEB RESULTS:\n- x (u)")
-        self.assertEqual(ans, "It's v15")
-        self.assertNotIn("reply with EXACTLY", seen["system"])   # re-ask prompt is grounded
-        self.assertIn("already been run", seen["system"])
-
-
 class TestStripLeadDisclaimer(unittest.TestCase):
     def test_strips_realtime_hedge_colon_form(self):
         from nitwit.session import _strip_lead_disclaimer
@@ -424,6 +377,11 @@ class TestStripLeadDisclaimer(unittest.TestCase):
         t = "I don't have real-time access. However, chapter 1140 is the latest."
         self.assertEqual(_strip_lead_disclaimer(t), "chapter 1140 is the latest.")
 
+    def test_strips_inline_comma_but_form(self):
+        from nitwit.session import _strip_lead_disclaimer
+        t = "I can't perform real-time web searches, but chapter 1140 is out."
+        self.assertEqual(_strip_lead_disclaimer(t), "chapter 1140 is out.")
+
     def test_leaves_ordinary_answer_untouched(self):
         from nitwit.session import _strip_lead_disclaimer
         for t in ["Next.js 15 is the latest version. It shipped recently.",
@@ -432,64 +390,3 @@ class TestStripLeadDisclaimer(unittest.TestCase):
             self.assertEqual(_strip_lead_disclaimer(t), t)
 
 
-class TestStreamAnswerNoDirectiveLeak(unittest.TestCase):
-    """A parroted SEARCH: on the (search-disabled) re-ask must never leak to the user."""
-
-    def test_parroted_directive_stripped_on_reask(self):
-        from nitwit import session
-        from nitwit.router import Endpoint
-
-        calls = {"n": 0}
-
-        class C1:
-            def __init__(self, *a, **k): pass
-            def stream_chat(self, messages, *, temperature, max_tokens, response_format=None):
-                yield {"type": "chunk", "content": "SEARCH: one piece\n"}
-                yield {"type": "done"}
-
-        class C2:  # weak model still parrots a directive line, then gives the real answer
-            def __init__(self, *a, **k): pass
-            def stream_chat(self, messages, *, temperature, max_tokens, response_format=None):
-                yield {"type": "chunk", "content": "SEARCH: one piece again\nChapter 1140 is the latest."}
-                yield {"type": "done"}
-
-        def factory(u, m, extra_body=None):
-            calls["n"] += 1
-            return C1() if calls["n"] == 1 else C2()
-
-        out = []
-        ep = Endpoint("http://x", "m", {})
-        ans = session.stream_answer("tell me more", None, _endpoint=ep, out=out.append,
-                                    _client_factory=factory, _search_fn=lambda q: "WEB RESULTS:\n- x (u)")
-        self.assertNotIn("SEARCH:", ans)
-        self.assertNotIn("SEARCH:", "".join(out))
-        self.assertIn("Chapter 1140 is the latest.", ans)
-
-    def test_pure_parroted_directive_falls_back_to_results(self):
-        from nitwit import session
-        from nitwit.router import Endpoint
-
-        calls = {"n": 0}
-
-        class C1:
-            def __init__(self, *a, **k): pass
-            def stream_chat(self, messages, *, temperature, max_tokens, response_format=None):
-                yield {"type": "chunk", "content": "SEARCH: one piece\n"}
-                yield {"type": "done"}
-
-        class C2:  # model emits ONLY a directive on the re-ask — nothing usable
-            def __init__(self, *a, **k): pass
-            def stream_chat(self, messages, *, temperature, max_tokens, response_format=None):
-                yield {"type": "chunk", "content": "SEARCH: one piece again\n"}
-                yield {"type": "done"}
-
-        def factory(u, m, extra_body=None):
-            calls["n"] += 1
-            return C1() if calls["n"] == 1 else C2()
-
-        ep = Endpoint("http://x", "m", {})
-        ans = session.stream_answer("tell me more", None, _endpoint=ep, out=lambda s: None,
-                                    _client_factory=factory,
-                                    _search_fn=lambda q: "WEB RESULTS:\n- Latest: chapter 1140 (u)")
-        self.assertNotIn("SEARCH:", ans)
-        self.assertIn("1140", ans)                       # fell back to the raw results, not blank

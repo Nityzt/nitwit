@@ -19,6 +19,15 @@ class TestRouter(unittest.TestCase):
         self.assertIn("8080", ep.base_url)
         self.assertEqual(ep.extra_body, {})
 
+    def test_synth_routes_to_gpu_7b_when_healthy(self):
+        ep = route("synth", health=lambda url: True)
+        self.assertIn("8080", ep.base_url)
+
+    def test_synth_falls_back_to_cpu_chat_when_gpu_down(self):
+        # only the CPU chat/verify endpoint (8086) is up, not the GPU (8080)
+        ep = route("synth", health=lambda url: "8086" in url)
+        self.assertIn("8086", ep.base_url)
+
     def test_verify_routes_to_4b(self):
         ep = route("verify", health=lambda url: True)
         self.assertEqual(ep.base_url, STAGE_DEFAULTS["verify"].base_url)
