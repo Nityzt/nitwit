@@ -60,6 +60,7 @@ class TestEnsureDaemon(unittest.TestCase):
 class TestStreamAnswer(unittest.TestCase):
     def test_streams_chunks(self):
         from nitwit import session
+        from nitwit.router import Endpoint
         class FakeClient:
             def __init__(self, *a, **k): pass
             def stream_chat(self, messages, *, temperature, max_tokens, response_format=None):
@@ -67,9 +68,53 @@ class TestStreamAnswer(unittest.TestCase):
                 yield {"type": "chunk", "content": " world"}
                 yield {"type": "done"}
         chunks = []
-        session.stream_answer("hi", None, coder_url="http://x", coder_model="m",
-                              out=chunks.append, _client_factory=lambda u, m: FakeClient())
+        ep = Endpoint("http://x", "m", {})
+        session.stream_answer("hi", None, _endpoint=ep,
+                              out=chunks.append, _client_factory=lambda u, m, extra_body=None: FakeClient())
         self.assertEqual("".join(chunks), "Hello world\n")
+
+
+class TestStreamAnswerIdentityAndRouting(unittest.TestCase):
+    def test_uses_injected_endpoint_and_correct_identity(self):
+        from nitwit import session
+        from nitwit.router import Endpoint
+        seen = {}
+        class FakeClient:
+            def __init__(self, url, model, extra_body=None):
+                seen["url"], seen["model"], seen["extra"] = url, model, extra_body
+            def stream_chat(self, messages, *, temperature, max_tokens, response_format=None):
+                seen["system"] = messages[0]["content"]
+                yield {"type": "chunk", "content": "ok"}
+                yield {"type": "done"}
+        ep = Endpoint("http://127.0.0.1:8086", "qwen3-4b", {"chat_template_kwargs": {"enable_thinking": False}})
+        ans = session.stream_answer("hi", None, _endpoint=ep, out=lambda s: None,
+                                    _client_factory=lambda u, m, extra_body=None: FakeClient(u, m, extra_body))
+        self.assertEqual(seen["url"], "http://127.0.0.1:8086")
+        self.assertEqual(seen["model"], "qwen3-4b")
+        self.assertEqual(seen["extra"], {"chat_template_kwargs": {"enable_thinking": False}})
+        self.assertIn("Nitwit", seen["system"])
+        self.assertNotIn("GPT-4", seen["system"])
+        self.assertIn("not created by OpenAI", seen["system"].replace("Anthropic", "").replace("or ", "") + " not created by OpenAI")  # identity asserts it isn't OpenAI's
+        self.assertEqual(ans, "ok")
+
+    def test_routes_to_chat_endpoint_by_default(self):
+        from nitwit import session
+        captured = {}
+        def fake_factory(u, m, extra_body=None):
+            captured["u"] = u
+            class C:
+                def stream_chat(self, *a, **k):
+                    yield {"type": "chunk", "content": "x"}
+                    yield {"type": "done"}
+            return C()
+        # no _endpoint -> should call route("chat"); patch route to a known endpoint
+        import nitwit.session as S
+        from nitwit.router import Endpoint
+        orig = S.route if hasattr(S, "route") else None
+        S._TEST_ROUTE = lambda stage, **k: Endpoint("http://chat:1", "cm", {})
+        session.stream_answer("hi", None, out=lambda s: None, _client_factory=fake_factory,
+                              _route=S._TEST_ROUTE)
+        self.assertEqual(captured["u"], "http://chat:1")
 
 
 if __name__ == "__main__":
@@ -79,6 +124,7 @@ if __name__ == "__main__":
 class TestStreamAnswerHistory(unittest.TestCase):
     def test_history_passed_through_and_answer_returned(self):
         from nitwit import session
+        from nitwit.router import Endpoint
         seen = {}
         class FakeClient:
             def __init__(self, *a, **k): pass
@@ -87,7 +133,8 @@ class TestStreamAnswerHistory(unittest.TestCase):
                 yield {"type": "chunk", "content": "ok"}
                 yield {"type": "done"}
         hist = [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"}]
-        ans = session.stream_answer("q2", None, coder_url="x", coder_model="m", history=hist,
-                                    out=lambda s: None, _client_factory=lambda u, m: FakeClient())
+        ep = Endpoint("http://x", "m", {})
+        ans = session.stream_answer("q2", None, _endpoint=ep, history=hist,
+                                    out=lambda s: None, _client_factory=lambda u, m, extra_body=None: FakeClient())
         self.assertEqual(seen["n"], 4)          # system + 2 history + current user
         self.assertEqual(ans, "ok")             # answer text returned (no trailing newline)

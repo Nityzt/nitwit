@@ -160,7 +160,7 @@ def _colors():
 _HISTORY_TURNS = 12
 
 
-def interactive(base, cwd, coder_url, coder_model):
+def interactive(base, cwd):
     C = _colors()
     if not session.ensure_daemon(base):
         print("could not start the nitwit daemon; check ~/.local/share/nitwit/daemon.log")
@@ -207,8 +207,7 @@ def interactive(base, cwd, coder_url, coder_model):
             _start_mission(base, repo, test_cmd, line)
         else:
             print(C["assist"], end="")
-            answer = session.stream_answer(line, repo, coder_url=coder_url,
-                                           coder_model=coder_model, history=history)
+            answer = session.stream_answer(line, repo, history=history)
             print(C["reset"], end="", flush=True)
             # remember the exchange so follow-ups have context (bounded)
             history.append({"role": "user", "content": line})
@@ -252,9 +251,7 @@ def main(argv=None):
         return cmd_new(args, base)
     if not args.cmd:
         try:
-            return interactive(base, os.getcwd(),
-                               os.environ.get("NITWIT_CODER_URL", "http://127.0.0.1:8080"),
-                               os.environ.get("NITWIT_CODER_MODEL", "qwen2.5-coder-7b"))
+            return interactive(base, os.getcwd())
         except KeyboardInterrupt:
             print()
             return

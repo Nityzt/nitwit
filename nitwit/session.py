@@ -85,24 +85,26 @@ def _default_chunk(s):
     sys.stdout.write(s); sys.stdout.flush()
 
 
-def stream_answer(text, repo, *, coder_url, coder_model, history=None, out=_default_chunk,
-                  _client_factory=None):
-    """Stream a chat answer, carrying the running conversation `history` (a list of
-    {"role","content"} turns) so follow-ups have context. Returns the full answer text
-    (so the caller can append it to the history). Never raises."""
+def stream_answer(text, repo, *, history=None, out=_default_chunk, _client_factory=None, _endpoint=None, _route=None):
+    """Stream a chat answer on the best-fit CHAT model (router-selected: fast CPU 4B), carrying
+    the conversation `history`. Returns the answer text. Never raises."""
     from orchestrator import OpenAICompatibleClient
-    factory = _client_factory or (lambda u, m: OpenAICompatibleClient(u, m))
+    from nitwit.router import route as _default_route
+    router = _route or _default_route
+    ep = _endpoint or router("chat")
+    factory = _client_factory or (lambda u, m, extra_body=None: OpenAICompatibleClient(u, m, extra_body=extra_body))
     files = ""
     if repo:
         try:
             files = ", ".join(sorted(os.listdir(repo))[:40])
         except Exception:
             files = ""
-    system = ("You are Nitwit, a concise local coding assistant"
-              + (f" working in the repository at {repo} (top-level entries: {files})." if repo
-                 else " (the user is not currently in a git repository).")
-              + " Answer the user's question directly and briefly. Use the conversation so far "
-                "for context; do not contradict earlier answers. Do not speculate about who built you.")
+    system = ("You are Nitwit, a local, self-hosted coding assistant. You run open-source models "
+              "on the user's own machine; you were not created by OpenAI or Anthropic — "
+              "if asked, say you are a local self-hosted assistant."
+              + (f" You are working in the repository at {repo} (top-level entries: {files})." if repo else "")
+              + " Answer directly and briefly, using the conversation so far for context; do not "
+                "contradict earlier answers.")
     messages = [{"role": "system", "content": system}]
     messages.extend(history or [])
     messages.append({"role": "user", "content": text})
@@ -113,7 +115,7 @@ def stream_answer(text, repo, *, coder_url, coder_model, history=None, out=_defa
         out(s)
 
     try:
-        client = factory(coder_url, coder_model)
+        client = factory(ep.base_url, ep.model, extra_body=ep.extra_body)
         for event in client.stream_chat(messages, temperature=0.2, max_tokens=800):
             if isinstance(event, dict):
                 if event.get("type") == "chunk":
