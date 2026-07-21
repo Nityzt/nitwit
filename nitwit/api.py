@@ -35,7 +35,25 @@ def make_server(daemon, port: int = 8807, host: str = "127.0.0.1") -> ThreadingH
             except ValueError:
                 return {}
 
+        def _host_ok(self) -> bool:
+            # Loopback binding stops remote hosts, not a browser: any page the user has
+            # open can still have JS POST to http://127.0.0.1:<port>, and a DNS-rebinding
+            # attacker can point a hostname at 127.0.0.1. The Host header is the only
+            # signal available to a same-origin-unaware handler like this one, so reject
+            # anything that isn't explicitly loopback/localhost.
+            host = self.headers.get("Host", "")
+            if host.startswith("["):
+                end = host.find("]")
+                hostname = host[:end + 1] if end != -1 else host
+            elif ":" in host:
+                hostname = host.rsplit(":", 1)[0]
+            else:
+                hostname = host
+            return hostname in ("127.0.0.1", "localhost", "::1", "[::1]")
+
         def do_GET(self):
+            if not self._host_ok():
+                return self._json(403, {"error": "forbidden host"})
             if self.path == "/status":
                 return self._json(200, daemon.status())
             if self.path == "/missions":
@@ -49,6 +67,8 @@ def make_server(daemon, port: int = 8807, host: str = "127.0.0.1") -> ThreadingH
             return self._json(404, {"error": "not found"})
 
         def do_POST(self):
+            if not self._host_ok():
+                return self._json(403, {"error": "forbidden host"})
             if self.path == "/control/on":
                 daemon.turn_on(); return self._json(200, daemon.status())
             if self.path == "/control/off":

@@ -6,7 +6,7 @@ import threading
 import time
 
 from nitwit.coder import Coder, CoderResponse, MissionContext, Verifier
-from nitwit.missions import Mission, MissionStore
+from nitwit.missions import InvalidTransition, Mission, MissionStore
 from nitwit.workspace import DirtyRepo, Workspace, git
 
 # Files bigger than this are skipped in the context snapshot (keep prompt bounded).
@@ -149,18 +149,42 @@ class MissionEngine:
         self._emit("mission_started", mission.id)
         workspaces = self._prepare_workspaces(mission)
         while True:
+            # An external actor (the API, another thread) may have moved this mission's
+            # DB row out of "running" between iterations -- pause/answer/cancel. Yield to
+            # that at the next iteration boundary instead of fighting it: a stale terminal
+            # write below (paused/queued -> done, e.g.) would otherwise raise
+            # InvalidTransition and surface as a spurious mission_error.
+            latest = self.store.get(mission.id)
+            if latest.state != "running":
+                self._emit("mission_finished", mission.id, state=latest.state)
+                return latest
             if self._paused.is_set():
-                mission = self.store.set_state(mission.id, "paused")
+                try:
+                    mission = self.store.set_state(mission.id, "paused")
+                except InvalidTransition:
+                    latest = self.store.get(mission.id)
+                    self._emit("mission_finished", mission.id, state=latest.state)
+                    return latest
                 self._emit("mission_finished", mission.id, state="paused")
                 return mission
             mission, done = self.run_iteration(mission, workspaces)
             if done:
-                mission = self.store.set_state(mission.id, "done")
+                try:
+                    mission = self.store.set_state(mission.id, "done")
+                except InvalidTransition:
+                    latest = self.store.get(mission.id)
+                    self._emit("mission_finished", mission.id, state=latest.state)
+                    return latest
                 self._emit("mission_finished", mission.id, state="done")
                 return mission
             if mission.iteration >= self.max_iterations:
                 self.store.append_note(mission.id, "hit max_iterations; awaiting input")
-                mission = self.store.set_state(mission.id, "needs_input")
+                try:
+                    mission = self.store.set_state(mission.id, "needs_input")
+                except InvalidTransition:
+                    latest = self.store.get(mission.id)
+                    self._emit("mission_finished", mission.id, state=latest.state)
+                    return latest
                 self._emit("mission_finished", mission.id, state="needs_input")
                 return mission
             if self.cooldown_s:

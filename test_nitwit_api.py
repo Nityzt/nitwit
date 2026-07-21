@@ -104,6 +104,31 @@ class TestApi(unittest.TestCase):
             urllib.request.urlopen(req, timeout=5)
         self.assertEqual(cm.exception.code, 400)
 
+    def test_spoofed_host_header_rejected(self):
+        # Simulates a DNS-rebinding / CSRF attack: a browser page that resolved
+        # "evil.com" to 127.0.0.1 and issues a request with that Host header.
+        # Loopback binding alone does not stop this -- the Host header must be checked.
+        req = urllib.request.Request(self.base + "/status", headers={"Host": "evil.com"})
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(req, timeout=5)
+        self.assertEqual(cm.exception.code, 403)
+
+        data = json.dumps({"goal": "pwn"}).encode()
+        req = urllib.request.Request(
+            self.base + "/missions", data=data,
+            headers={"Content-Type": "application/json", "Host": "evil.com"}, method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(req, timeout=5)
+        self.assertEqual(cm.exception.code, 403)
+
+    def test_normal_host_header_still_works(self):
+        # Default urllib/browser requests to 127.0.0.1:<port> send a matching Host
+        # header and must keep working.
+        st, body = _get(self.base + "/status")
+        self.assertEqual(st, 200)
+        self.assertIn("on", body)
+
 
 if __name__ == "__main__":
     unittest.main()

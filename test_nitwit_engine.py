@@ -181,6 +181,36 @@ class TestEngineLoop(unittest.TestCase):
         with open(readme_path) as fh:
             self.assertEqual(fh.read(), readme_before)
 
+    def test_external_pause_during_run_is_honored_without_invalid_transition(self):
+        # A PausingCoder mimics the API changing the mission's DB state mid-run (e.g. a
+        # POST /missions/{id}/pause landing between iterations). On its first call it
+        # proposes wrong content (so criteria don't pass) AND flips the store's state to
+        # "paused" out from under the engine -- simulating the external race. The engine
+        # must notice this at the top of the next loop iteration and return cleanly with
+        # state == "paused", rather than later calling set_state(..., "done"/"needs_input")
+        # and blowing up with InvalidTransition on the now-invalid running-assumed transition.
+        store = self.store
+        mission_id_holder = {}
+
+        class PausingCoder:
+            def __init__(self):
+                self.calls = 0
+
+            def propose(self, ctx):
+                self.calls += 1
+                if self.calls == 1:
+                    store.set_state(mission_id_holder["id"], "paused")
+                    return CoderResponse(edits=[FileEdit("target.txt", "nope\n")], note="attempt 1")
+                return CoderResponse(edits=[FileEdit("target.txt", "ok\n")], note="attempt 2")
+
+        m = self._mission([{"type": "tests", "repo": self.repo, "cmd": "grep -q ok target.txt"}])
+        mission_id_holder["id"] = m.id
+        coder = PausingCoder()
+        engine = MissionEngine(self.store, coder, FakeVerifier(True), max_iterations=3)
+        result = engine.run_mission(m.id)
+        self.assertEqual(result.state, "paused")
+        self.assertEqual(coder.calls, 1)  # loop must not have proceeded to a 2nd iteration
+
     def test_empty_success_criteria_never_vacuously_done(self):
         # Zero success_criteria must not be treated as trivially satisfied; the mission
         # should keep iterating (and hit the cap) rather than complete after one no-op pass.
