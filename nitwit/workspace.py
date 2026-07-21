@@ -1,0 +1,57 @@
+"""Workspace: git branch + file edits + sandboxed test runs for one repo. Never push/merge."""
+from __future__ import annotations
+
+import os
+import subprocess
+from dataclasses import dataclass
+
+
+class DirtyRepo(Exception):
+    pass
+
+
+@dataclass
+class FileEdit:
+    path: str      # repo-relative
+    content: str   # full new file content (write_file semantics)
+
+
+def git(repo_path: str, *args: str) -> str:
+    proc = subprocess.run(
+        ["git", "-C", repo_path, *args],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
+    return proc.stdout.strip()
+
+
+class Workspace:
+    def __init__(self, repo_path: str) -> None:
+        self.repo_path = repo_path
+
+    def is_clean(self) -> bool:
+        return git(self.repo_path, "status", "--porcelain") == ""
+
+    def ensure_branch(self, branch: str) -> None:
+        if not self.is_clean():
+            raise DirtyRepo(f"{self.repo_path} has uncommitted changes; refusing to start")
+        existing = git(self.repo_path, "branch", "--list", branch)
+        if existing:
+            git(self.repo_path, "checkout", "-q", branch)
+        else:
+            git(self.repo_path, "checkout", "-q", "-b", branch)
+
+    def apply_edits(self, edits: list[FileEdit]) -> None:
+        for edit in edits:
+            full = os.path.join(self.repo_path, edit.path)
+            os.makedirs(os.path.dirname(full) or self.repo_path, exist_ok=True)
+            with open(full, "w") as fh:
+                fh.write(edit.content)
+
+    def commit(self, message: str) -> str:
+        git(self.repo_path, "add", "-A")
+        if git(self.repo_path, "status", "--porcelain") == "":
+            return ""
+        git(self.repo_path, "commit", "-q", "-m", message)
+        return git(self.repo_path, "rev-parse", "--short", "HEAD")
