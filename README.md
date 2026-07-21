@@ -275,3 +275,34 @@ python3 -m unittest -v
   relevant snippets.
 - Improve replanning beyond the current verifier `missing_tasks` follow-up loop.
 - Persist traces as JSONL so failures can be inspected and prompts can be tuned.
+
+## `wit` — the interactive agent CLI
+
+Install the launcher once:
+
+```bash
+bash deploy/install-wit.sh      # -> ~/.local/bin/wit
+```
+
+Then, from inside any git repo, just run:
+
+```bash
+cd ~/my-project
+wit
+```
+
+`wit` opens a conversational session (like Claude Code / codex / agy). It auto-starts the
+mission daemon, detects the current repo and its test command, and you talk to it naturally:
+
+- **A question** (`what does parse() do?`) is answered inline, streamed.
+- **A task** (`add a /health endpoint`, `fix the failing test`) auto-escalates into a durable
+  **mission**: it works on an `agent/<slug>` branch, streams its progress, and commits as it goes.
+  Press **Ctrl-C to detach** — the mission keeps running in the daemon; reopen `wit` and it's still
+  there. Nothing ever touches your main branch or gets pushed.
+
+Slash commands inside the session: `/missions`, `/diff <id>`, `/status`, `/on`, `/off`,
+`/mission <goal>` (force a mission), `/quit`. Review a mission's work with `wit diff <id>` or
+`git -C <repo> diff main..agent/<slug>`, then merge it yourself.
+
+For scripting, the subcommands still work non-interactively: `wit new "..." --repo P --test CMD`,
+`wit ls`, `wit tail <id>`, `wit on|off|status`, `wit -p "quick question"`.

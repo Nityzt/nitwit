@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# `wit` — launch the nitwit CLI from any directory. Keeps your CWD (so it detects the
+# current git repo) but puts the nitwit package on PYTHONPATH so `import nitwit` resolves.
+exec env PYTHONPATH="/home/nit/qwen-orchestrator${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m nitwit.cli "$@"
