@@ -138,7 +138,7 @@ def _stream_and_peek(client, messages, out, parts, allow_search):
         s = buf.lstrip()
         if allow_search and len(s) >= 7 and s[:7].upper() == "SEARCH:":
             if "\n" in s or len(s) > 160:            # have the full query line
-                return s[7:].splitlines()[0].strip()
+                return (s[7:].splitlines() or [""])[0].strip()
             continue                                  # keep buffering the query line
         if len(s) >= 7:                               # enough to know it's NOT a SEARCH directive
             committed = True
@@ -146,7 +146,7 @@ def _stream_and_peek(client, messages, out, parts, allow_search):
     if not committed and buf:                         # short reply below the 7-char threshold
         s = buf.lstrip()
         if allow_search and s[:7].upper() == "SEARCH:":
-            return s[7:].splitlines()[0].strip()
+            return (s[7:].splitlines() or [""])[0].strip()
         out(buf); parts.append(buf)
     return None
 
@@ -206,7 +206,7 @@ def stream_answer(text, repo, *, history=None, out=_default_chunk, _client_facto
         client = factory(ep.base_url, ep.model, extra_body=ep.extra_body)
         query = _stream_and_peek(client, messages, out, parts, allow_search)
         if query is not None:                         # the model asked to search
-            results = do_search(query)
+            results = do_search(query or text)        # empty model query → fall back to the question
             messages.append({"role": "system",
                              "content": "WEB RESULTS (use these, cite URLs):\n" + results})
             parts.clear()                             # discard the SEARCH: directive text
